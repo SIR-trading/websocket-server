@@ -1,59 +1,54 @@
 # SIR WebSocket Server
 
-Multi-chain real-time WebSocket server that watches SIR contract events (auctions, bids, dividends) across all configured chains from a single process and broadcasts them to connected frontends via Socket.IO.
+Real-time event server for the SIR protocol. Broadcasts auction events to frontends and computes leaderboard rankings in the background.
 
-## Setup
+## What It Does
 
-### 1. Install dependencies
+1. **Real-time Events** - Watches SIR contracts for auctions, bids, and dividends, then broadcasts to connected frontends via Socket.IO
+2. **Leaderboard Worker** - Computes position PnL every 10 minutes and stores rankings in Redis
 
-From the **monorepo root** (`SIR/`):
+## Quick Start
+
+### 1. Install
 
 ```bash
+# From monorepo root (SIR/)
 pnpm install
 ```
 
-### 2. Configure environment
+### 2. Configure
 
 ```bash
+cd websocket-server
 cp .env.example .env
 ```
 
-Edit `.env` with your values:
+Edit `.env` with your values. At minimum you need:
 
-| Variable | Description |
-|----------|-------------|
-| `CHAIN_IDS` | Comma-separated chain IDs (e.g. `1,999,6343`) |
-| `WSS_URLS` | WebSocket RPC URLs, one per chain (e.g. Alchemy WSS endpoints) |
-| `SIR_CONTRACT_ADDRESSES` | SIR token/staking/auction contract per chain (the single contract that handles the SIR token, staking, dividends, and auctions — found in `App/public/build-data.json` → `contractAddresses.sir`) |
-| `FRONTEND_URLS` | Allowed CORS origins (e.g. `https://sir.trading,http://localhost:3000`) |
-| `PORT` | Server port (default: `8080`) |
-
-All vector variables (`CHAIN_IDS`, `WSS_URLS`, `SIR_CONTRACT_ADDRESSES`) must have the same number of comma-separated values.
-
-### 3. Run locally
-
-**Development** (with hot reload):
-
-```bash
-# From monorepo root
-pnpm ws:dev
-
-# Or from this directory
-pnpm dev
+```env
+CHAIN_IDS=1,999,6343
+WSS_URLS=wss://eth-mainnet.g.alchemy.com/v2/KEY,...
+SIR_CONTRACT_ADDRESSES=0x4Da4...,0xA06D...,0x2149...
+FRONTEND_URLS=https://app.sir.trading,http://localhost:3000
 ```
 
-**Production build:**
+For the leaderboard worker, also add:
 
-```bash
-pnpm ws:build
-pnpm ws:start
+```env
+LEADERBOARD_WORKER_ENABLED=true
+REDIS_URL=redis://...
+RPC_URLS=https://eth-mainnet.g.alchemy.com/v2/KEY,...
+SUBGRAPH_URLS=https://api.goldsky.com/...,...
 ```
 
-**Run both WS server + App together:**
+### 3. Run
 
 ```bash
-# From monorepo root — starts WS on :8080 and App on :3000
+# Development (hot reload)
 pnpm dev
+
+# Production
+pnpm build && pnpm start
 ```
 
 ### 4. Verify
@@ -62,93 +57,71 @@ pnpm dev
 curl http://localhost:8080/health
 ```
 
-Returns per-chain watcher status:
-
-```json
-{
-  "status": "ok",
-  "connections": 0,
-  "uptime": 12.34,
-  "chains": [
-    { "chainId": 1, "transport": "webSocket", "status": "watching" },
-    { "chainId": 999, "transport": "webSocket", "status": "watching" },
-    { "chainId": 6343, "transport": "http", "status": "watching" }
-  ]
-}
-```
-
-## Architecture
-
-- One **viem client per chain**, each watching the SIR contract for events
-- **Auto-fallback**: every chain starts with a WebSocket (`eth_subscribe`). If the RPC doesn't support subscriptions (e.g. MegaETH / chain 6343), the server automatically tears down the WSS watcher and re-creates it with HTTP polling (`eth_getLogs`, 30 s interval). The HTTP URL is derived from the WSS URL (`wss://` → `https://`) — no extra env vars needed.
-- Single **Socket.IO server** broadcasts events to all connected frontends
-- Every event payload includes `chainId` so the frontend can scope invalidation
-- In-memory cache of the last 50 events — new clients receive the 10 most recent on connect
-- `/health` endpoint exposes `transport` (`"webSocket"` or `"http"`) per chain
-
 ## Events
 
-| Socket.IO Event | Contract Event | Payload |
-|-----------------|---------------|---------|
-| `auctionStarted` | `AuctionStarted` | `chainId`, `token`, `amount`, `txHash`, `blockNumber` |
-| `bidReceived` | `BidReceived` | `chainId`, `token`, `bidder`, `bid`, `txHash`, `blockNumber` |
-| `auctionSettled` | `AuctionedTokensSentToWinner` | `chainId`, `token`, `winner`, `amount`, `txHash`, `blockNumber` |
-| `dividendsPaid` | `DividendsPaid` | `chainId`, `amountETH`, `amountStakedSIR`, `txHash`, `blockNumber` |
+The server broadcasts these Socket.IO events:
+
+| Event | Description |
+|-------|-------------|
+| `auctionStarted` | New auction began |
+| `bidReceived` | Someone placed a bid |
+| `auctionSettled` | Auction ended, tokens sent to winner |
+| `dividendsPaid` | Dividends distributed to stakers |
+
+All events include `chainId` so frontends can filter by chain.
 
 ## Deploy on Railway
 
-### 1. Create a new service
+1. **Create service** - New → GitHub Repo → select `SIR` monorepo
 
-In your Railway project, click **New** → **GitHub Repo** and select the `SIR` monorepo.
+2. **Build settings:**
+   - Root Directory: `websocket-server`
+   - Build Command: `npm install && npm run build`
+   - Start Command: `npm start`
 
-### 2. Configure build settings
+3. **Environment variables** - Add all variables from `.env.example`
 
-In the service **Settings** tab:
+4. **Generate domain** - Settings → Networking → Generate Domain
 
-| Setting | Value |
-|---------|-------|
-| **Root Directory** | `websocket-server` |
-| **Build Command** | `npm install && npm run build` |
-| **Start Command** | `npm start` |
+5. **Health check** - Point to `/health` endpoint
 
-Railway auto-detects Node.js via `package.json`. No Dockerfile needed.
+## Connect from App
 
-### 3. Set environment variables
+In the Next.js App's `.env`:
 
-In the **Variables** tab, add:
-
-| Variable | Example |
-|----------|---------|
-| `CHAIN_IDS` | `1,999,6343` |
-| `WSS_URLS` | `wss://eth-mainnet.g.alchemy.com/v2/KEY,wss://...,...` |
-| `SIR_CONTRACT_ADDRESSES` | `0x4Da4...,0xA06D...,0x2149...` |
-| `FRONTEND_URLS` | `https://app.sir.trading,https://sir.trading` |
-| `PORT` | `${{RAILWAY_PORT}}` (Railway injects this automatically; you can also omit it — defaults to `8080`) |
-
-### 4. Networking
-
-- Railway assigns a **public domain** under **Settings → Networking → Generate Domain** (e.g. `sir-ws.up.railway.app`).
-- The App connects via `NEXT_PUBLIC_WEBSOCKET_URL=https://sir-ws.up.railway.app` in its own env.
-- Make sure the Railway domain is included in `FRONTEND_URLS` if the App itself is on a different domain (CORS).
-
-### 5. Health check
-
-Railway supports HTTP health checks. Point it at `/health` on the assigned port. The endpoint returns `200` with per-chain watcher status.
-
-### 6. Verify
-
-```bash
-curl https://sir-ws.up.railway.app/health
+```env
+NEXT_PUBLIC_WEBSOCKET_URL=https://your-railway-domain.up.railway.app
 ```
 
-All chains should show `status: "watching"`. Chains without WSS support (e.g. 6343) will show `transport: "http"` after automatic fallback.
+The App's `useRealtimeAuctions` hook connects automatically. Falls back to polling if not set.
 
-## Frontend Integration
+## Leaderboard Worker
 
-The App's `useRealtimeAuctions` hook connects automatically when `NEXT_PUBLIC_WEBSOCKET_URL` is set in the App's `.env`:
+When enabled, the worker:
+- Runs every 10 minutes
+- Fetches positions from subgraph
+- Computes PnL using on-chain data
+- Writes rankings to Redis ZSETs
 
-```
-NEXT_PUBLIC_WEBSOCKET_URL=http://localhost:8080
-```
+The App's `/api/leaderboard/active` endpoint reads directly from Redis for instant responses.
 
-When not set, the hook falls back to 5-minute polling.
+Check worker status in `/health` response under `leaderboardWorker`.
+
+## Environment Reference
+
+| Variable | Required | Description |
+|----------|:--------:|-------------|
+| `CHAIN_IDS` | ✓ | Chain IDs (e.g., `1,999,6343`) |
+| `WSS_URLS` | ✓ | WebSocket RPCs for events |
+| `SIR_CONTRACT_ADDRESSES` | ✓ | SIR contract per chain |
+| `FRONTEND_URLS` | ✓ | CORS origins |
+| `PORT` | | Default: `8080` |
+| `LEADERBOARD_WORKER_ENABLED` | | Set `true` to enable |
+| `REDIS_URL` | Worker | Redis connection |
+| `RPC_URLS` | Worker | HTTP RPCs for multicalls |
+| `SUBGRAPH_URLS` | Worker | Goldsky endpoints |
+| `SUBGRAPH_API_KEY` | | Subgraph auth |
+| `COINGECKO_API_KEY` | | Price fetching |
+| `MAX_POSITIONS_PER_RUN` | | Default: `500` |
+
+Vector variables (`CHAIN_IDS`, `WSS_URLS`, `RPC_URLS`, etc.) must have matching counts.

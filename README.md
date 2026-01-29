@@ -95,6 +95,54 @@ Returns per-chain watcher status:
 | `auctionSettled` | `AuctionedTokensSentToWinner` | `chainId`, `token`, `winner`, `amount`, `txHash`, `blockNumber` |
 | `dividendsPaid` | `DividendsPaid` | `chainId`, `amountETH`, `amountStakedSIR`, `txHash`, `blockNumber` |
 
+## Deploy on Railway
+
+### 1. Create a new service
+
+In your Railway project, click **New** → **GitHub Repo** and select the `SIR` monorepo.
+
+### 2. Configure build settings
+
+In the service **Settings** tab:
+
+| Setting | Value |
+|---------|-------|
+| **Root Directory** | `websocket-server` |
+| **Build Command** | `npm install && npm run build` |
+| **Start Command** | `npm start` |
+
+Railway auto-detects Node.js via `package.json`. No Dockerfile needed.
+
+### 3. Set environment variables
+
+In the **Variables** tab, add:
+
+| Variable | Example |
+|----------|---------|
+| `CHAIN_IDS` | `1,999,6343` |
+| `WSS_URLS` | `wss://eth-mainnet.g.alchemy.com/v2/KEY,wss://...,...` |
+| `SIR_CONTRACT_ADDRESSES` | `0x4Da4...,0xA06D...,0x2149...` |
+| `FRONTEND_URLS` | `https://app.sir.trading,https://sir.trading` |
+| `PORT` | `${{RAILWAY_PORT}}` (Railway injects this automatically; you can also omit it — defaults to `8080`) |
+
+### 4. Networking
+
+- Railway assigns a **public domain** under **Settings → Networking → Generate Domain** (e.g. `sir-ws.up.railway.app`).
+- The App connects via `NEXT_PUBLIC_WEBSOCKET_URL=https://sir-ws.up.railway.app` in its own env.
+- Make sure the Railway domain is included in `FRONTEND_URLS` if the App itself is on a different domain (CORS).
+
+### 5. Health check
+
+Railway supports HTTP health checks. Point it at `/health` on the assigned port. The endpoint returns `200` with per-chain watcher status.
+
+### 6. Verify
+
+```bash
+curl https://sir-ws.up.railway.app/health
+```
+
+All chains should show `status: "watching"`. Chains without WSS support (e.g. 6343) will show `transport: "http"` after automatic fallback.
+
 ## Frontend Integration
 
 The App's `useRealtimeAuctions` hook connects automatically when `NEXT_PUBLIC_WEBSOCKET_URL` is set in the App's `.env`:

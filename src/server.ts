@@ -12,6 +12,11 @@ import {
   type Transport,
   parseAbiItem,
 } from "viem";
+import {
+  startLeaderboardWorker,
+  getWorkerStatus,
+} from "./workers/leaderboard/index.js";
+import { closeRedisClient } from "./lib/redis.js";
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -371,6 +376,7 @@ function setupChainWatcher(
 // ---------------------------------------------------------------------------
 
 app.get("/health", (_req, res) => {
+  const workerStatus = getWorkerStatus();
   res.json({
     status: "ok",
     connections: io.engine.clientsCount,
@@ -381,6 +387,7 @@ app.get("/health", (_req, res) => {
       status: w.status,
       ...(w.error ? { error: w.error } : {}),
     })),
+    leaderboardWorker: workerStatus,
   });
 });
 
@@ -405,11 +412,14 @@ io.on("connection", (socket) => {
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 
-function shutdown() {
+async function shutdown() {
   console.log("[Server] Shutting down...");
 
   // Unwatch all events across all chains
   watchers.forEach((w) => w.unwatchFns.forEach((fn) => fn()));
+
+  // Close Redis connection
+  await closeRedisClient();
 
   // Close Socket.IO
   void io.close(() => {
@@ -423,8 +433,8 @@ function shutdown() {
   });
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
 
 // ---------------------------------------------------------------------------
 // Start
@@ -447,6 +457,9 @@ async function main() {
       console.log(
         `[Server] Watching ${CHAIN_IDS.length} chain(s): ${CHAIN_IDS.join(", ")}`
       );
+
+      // Start leaderboard background worker
+      startLeaderboardWorker();
     });
   } catch (error) {
     console.error("[Server] Failed to start:", error);

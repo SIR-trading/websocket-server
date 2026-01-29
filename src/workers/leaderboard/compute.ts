@@ -143,14 +143,6 @@ export async function computeAndWritePositions(
     const debtPriceUsd =
       prices[pos.vault.debtToken.id.toLowerCase()] ?? 0;
 
-    // Debug: log when debt price is missing
-    if (debtPriceUsd === 0) {
-      console.warn(
-        `[Compute] Missing debt price for ${pos.vault.debtToken.symbol} (${pos.vault.debtToken.id}). ` +
-        `Available prices: ${Object.keys(prices).join(", ")}`
-      );
-    }
-
     const currentPositionValueUsd = currentCollateralAmount * collateralPriceUsd;
     const originalDepositValueUsd = parseFloat(pos.dollarTotal);
 

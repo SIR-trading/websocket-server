@@ -325,20 +325,11 @@ export async function fetchPrices(
 
   // Step 2: Ensure wrapped native has a price (use coin ID if contract lookup failed)
   if (!priceMap[wrappedNativeLower] && config.coingeckoNativeId) {
-    console.log(`[Prices] Wrapped native ${wrappedNativeLower} not in CoinGecko response, fetching via coin ID ${config.coingeckoNativeId}`);
     const nativePrice = await fetchNativePrice(config.coingeckoNativeId);
     if (nativePrice > 0) {
       priceMap[wrappedNativeLower] = nativePrice;
-      console.log(`[Prices] Got native price: $${nativePrice}`);
-    } else {
-      console.warn(`[Prices] Failed to get native price for ${config.coingeckoNativeId}`);
     }
   }
-
-  // Debug: log all fetched prices
-  console.log(`[Prices] Fetched ${Object.keys(priceMap).length} prices:`,
-    Object.entries(priceMap).map(([k, v]) => `${k.slice(0, 10)}...=$${v.toFixed(2)}`).join(", ")
-  );
 
   // Find tokens still missing prices
   const missingTokens = tokenAddresses.filter(
@@ -394,6 +385,5 @@ export function getUniqueTokens(
       tokens.set(debtAddr, { decimals: pos.vault.debtToken.decimals });
     }
   }
-  console.log(`[Prices] Unique tokens to fetch: ${Array.from(tokens.keys()).map(t => t.slice(0, 10) + "...").join(", ")}`);
   return tokens;
 }

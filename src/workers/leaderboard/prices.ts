@@ -332,18 +332,28 @@ export async function fetchPrices(
 }
 
 /**
- * Extract unique collateral tokens from positions
+ * Extract unique collateral AND debt tokens from positions
+ * (debt tokens needed for quote-denominated price calculations)
  */
 export function getUniqueTokens(
   positions: Array<{
-    vault: { collateralToken: { id: string; decimals: number } };
+    vault: {
+      collateralToken: { id: string; decimals: number };
+      debtToken: { id: string; decimals: number };
+    };
   }>
 ): Map<string, { decimals: number }> {
   const tokens = new Map<string, { decimals: number }>();
   for (const pos of positions) {
-    const addr = pos.vault.collateralToken.id.toLowerCase();
-    if (!tokens.has(addr)) {
-      tokens.set(addr, { decimals: pos.vault.collateralToken.decimals });
+    // Add collateral token
+    const collateralAddr = pos.vault.collateralToken.id.toLowerCase();
+    if (!tokens.has(collateralAddr)) {
+      tokens.set(collateralAddr, { decimals: pos.vault.collateralToken.decimals });
+    }
+    // Add debt token (needed for quote-denominated prices)
+    const debtAddr = pos.vault.debtToken.id.toLowerCase();
+    if (!tokens.has(debtAddr)) {
+      tokens.set(debtAddr, { decimals: pos.vault.debtToken.decimals });
     }
   }
   return tokens;

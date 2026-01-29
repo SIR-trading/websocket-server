@@ -41,8 +41,8 @@ export interface ComputedPositionData {
   pnlUsdPercentage: number;
   dollarTotal: number;
   currentValueUsd: number;
-  entryPriceUsd: number;
-  currentPriceUsd: number;
+  entryPrice: number; // Price of collateral in quote token terms at entry
+  currentPrice: number; // Current price of collateral in quote token terms
   createdAt: number;
 }
 

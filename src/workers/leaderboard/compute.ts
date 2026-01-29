@@ -138,12 +138,15 @@ export async function computeAndWritePositions(
       pos.vault.collateralToken.decimals
     );
 
-    const currentPriceUsd =
+    const collateralPriceUsd =
       prices[pos.vault.collateralToken.id.toLowerCase()] ?? 0;
-    const currentPositionValueUsd = currentCollateralAmount * currentPriceUsd;
+    const debtPriceUsd =
+      prices[pos.vault.debtToken.id.toLowerCase()] ?? 0;
+
+    const currentPositionValueUsd = currentCollateralAmount * collateralPriceUsd;
     const originalDepositValueUsd = parseFloat(pos.dollarTotal);
 
-    // Calculate entry price from original deposit / original collateral amount
+    // Calculate entry price in USD from original deposit / original collateral amount
     const originalCollateralAmount = +formatUnits(
       BigInt(pos.collateralTotal),
       pos.vault.collateralToken.decimals
@@ -152,6 +155,11 @@ export async function computeAndWritePositions(
       originalCollateralAmount > 0
         ? originalDepositValueUsd / originalCollateralAmount
         : 0;
+
+    // Convert prices to quote terms (collateral per debt token)
+    // For stablecoin quotes (USDT, USDC), debtPriceUsd ≈ 1, so this is nearly the same as USD
+    const currentPrice = debtPriceUsd > 0 ? collateralPriceUsd / debtPriceUsd : 0;
+    const entryPrice = debtPriceUsd > 0 ? entryPriceUsd / debtPriceUsd : 0;
 
     const pnlUsd = currentPositionValueUsd - originalDepositValueUsd;
     const pnlUsdPercentage =
@@ -171,8 +179,8 @@ export async function computeAndWritePositions(
       pnlUsdPercentage,
       dollarTotal: originalDepositValueUsd,
       currentValueUsd: currentPositionValueUsd,
-      entryPriceUsd,
-      currentPriceUsd,
+      entryPrice,
+      currentPrice,
       createdAt: parseInt(pos.createdAt, 10),
     };
 
@@ -248,8 +256,8 @@ async function writePositionToRedis(
     pnlUsdPercentage: computed.pnlUsdPercentage,
     dollarTotal: computed.dollarTotal,
     currentValueUsd: computed.currentValueUsd,
-    entryPriceUsd: computed.entryPriceUsd,
-    currentPriceUsd: computed.currentPriceUsd,
+    entryPrice: computed.entryPrice,
+    currentPrice: computed.currentPrice,
     createdAt: computed.createdAt,
   };
   pipeline.hSet(

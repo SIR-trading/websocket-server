@@ -117,9 +117,13 @@ interface ChainWatcher {
   status: "connecting" | "watching" | "error";
   error?: string;
   unwatchFns: (() => void)[];
+  wsRetryTimer?: ReturnType<typeof setTimeout>;
 }
 
 const watchers: ChainWatcher[] = [];
+
+// How often to retry WebSocket when in HTTP fallback mode (1 hour)
+const WS_RETRY_INTERVAL_MS = 60 * 60 * 1000;
 
 /** Convert a WSS URL to an HTTPS URL for HTTP polling fallback. */
 function deriveHttpUrl(wssUrl: string): string {
@@ -128,43 +132,58 @@ function deriveHttpUrl(wssUrl: string): string {
 
 /** Returns true if the error looks like an eth_subscribe / method-not-found rejection. */
 function isSubscribeError(error: unknown): boolean {
-  const msg =
-    error instanceof Error
-      ? error.message
-      : typeof error === "object" && error !== null && "message" in error
-        ? String((error as { message: unknown }).message)
-        : typeof error === "string"
-          ? error
-          : JSON.stringify(error);
+  const msg = getErrorMessage(error);
   const lower = msg.toLowerCase();
   return lower.includes("eth_subscribe") || lower.includes("method not found");
+}
+
+/** Returns true if the error indicates the WebSocket connection was closed. */
+function isSocketClosedError(error: unknown): boolean {
+  const msg = getErrorMessage(error);
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("socket") &&
+    (lower.includes("closed") || lower.includes("disconnected"))
+  );
+}
+
+/** Extract error message from various error types. */
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && error !== null && "message" in error) {
+    return String((error as { message: unknown }).message);
+  }
+  if (typeof error === "string") return error;
+  return JSON.stringify(error);
 }
 
 /**
  * Attach the 4 watchContractEvent listeners to a viem client.
  * Returns the array of unwatch functions.
  *
- * If `onSubscribeError` is provided, the first eth_subscribe-related error from
- * any watcher will invoke it exactly once so the caller can switch transports.
+ * If `onFallbackNeeded` is provided, it will be called once when:
+ * - eth_subscribe is not supported, OR
+ * - the WebSocket connection is closed
  */
 function setupWatchers(
   client: PublicClient<Transport>,
   chainId: number,
   contractAddress: Address,
   watcher: ChainWatcher,
-  onSubscribeError?: () => void
+  onFallbackNeeded?: () => void
 ): (() => void)[] {
-  let subscribeFailed = false;
+  let fallbackTriggered = false;
 
   function handleError(eventName: string) {
     return (error: Error) => {
-      if (isSubscribeError(error)) {
-        if (onSubscribeError && !subscribeFailed) {
-          subscribeFailed = true;
-          onSubscribeError();
+      // Check if we need to fall back to HTTP
+      if (isSubscribeError(error) || isSocketClosedError(error)) {
+        if (onFallbackNeeded && !fallbackTriggered) {
+          fallbackTriggered = true;
+          const reason = isSocketClosedError(error) ? "socket closed" : "eth_subscribe not supported";
+          console.warn(`[Chain ${chainId}] ${eventName}: ${reason}, switching to HTTP polling`);
+          onFallbackNeeded();
         }
-        // Whether first or subsequent, silently ignore subscribe errors
-        // (the fallback handles the first; the rest are expected duplicates)
         return;
       }
       console.error(`[Chain ${chainId}] ${eventName} watch error:`, error);
@@ -288,6 +307,135 @@ function setupWatchers(
   return fns;
 }
 
+/**
+ * Switch a watcher to HTTP polling mode.
+ */
+function switchToHttpPolling(
+  watcher: ChainWatcher,
+  wssUrl: string,
+  contractAddress: Address
+): void {
+  const { chainId } = watcher;
+  const httpUrl = deriveHttpUrl(wssUrl);
+
+  try {
+    const httpClient = createPublicClient({
+      transport: http(httpUrl, { batch: true }),
+      pollingInterval: 30_000,
+    });
+
+    watcher.unwatchFns = setupWatchers(
+      httpClient,
+      chainId,
+      contractAddress,
+      watcher
+      // no onFallbackNeeded — HTTP polling uses eth_getLogs, not eth_subscribe
+    );
+
+    watcher.transportType = "http";
+    watcher.status = "watching";
+    watcher.error = undefined;
+    console.log(`[Chain ${chainId}] Watching contract ${contractAddress} (http poll)`);
+
+    // Schedule periodic WebSocket retry
+    scheduleWsRetry(watcher, wssUrl, contractAddress);
+  } catch (httpError) {
+    watcher.status = "error";
+    watcher.error = String(httpError);
+    console.error(`[Chain ${chainId}] HTTP fallback failed:`, httpError);
+  }
+}
+
+/**
+ * Try to reconnect via WebSocket. If successful, cancel HTTP polling.
+ * If WebSocket fails again, stay on HTTP and schedule another retry.
+ */
+function tryWebSocketReconnect(
+  watcher: ChainWatcher,
+  wssUrl: string,
+  contractAddress: Address
+): void {
+  const { chainId } = watcher;
+  console.log(`[Chain ${chainId}] Attempting WebSocket reconnect...`);
+
+  try {
+    const wsClient = createPublicClient({
+      transport: webSocket(wssUrl, {
+        reconnect: { attempts: 3, delay: 1000 },
+        keepAlive: { interval: 30_000 },
+      }),
+    });
+
+    // Set up a test — if we get a fallback callback quickly, WS still doesn't work
+    let wsFailed = false;
+    const testUnwatchFns = setupWatchers(
+      wsClient,
+      chainId,
+      contractAddress,
+      watcher,
+      () => {
+        wsFailed = true;
+      }
+    );
+
+    // Give it a moment to fail if it's going to
+    setTimeout(() => {
+      if (wsFailed) {
+        // Clean up test watchers
+        testUnwatchFns.forEach((fn) => fn());
+        console.log(`[Chain ${chainId}] WebSocket still unavailable, staying on HTTP`);
+        // Schedule another retry
+        scheduleWsRetry(watcher, wssUrl, contractAddress);
+      } else {
+        // WebSocket is working! Tear down HTTP and use WS
+        console.log(`[Chain ${chainId}] WebSocket reconnected successfully`);
+        watcher.unwatchFns.forEach((fn) => fn());
+        watcher.unwatchFns = testUnwatchFns;
+        watcher.transportType = "webSocket";
+        watcher.status = "watching";
+        watcher.error = undefined;
+
+        // Re-setup with proper fallback handler
+        watcher.unwatchFns.forEach((fn) => fn());
+        watcher.unwatchFns = setupWatchers(
+          wsClient,
+          chainId,
+          contractAddress,
+          watcher,
+          () => {
+            watcher.unwatchFns.forEach((fn) => fn());
+            watcher.unwatchFns = [];
+            switchToHttpPolling(watcher, wssUrl, contractAddress);
+          }
+        );
+      }
+    }, 5000);
+  } catch (error) {
+    console.log(`[Chain ${chainId}] WebSocket reconnect failed:`, error);
+    scheduleWsRetry(watcher, wssUrl, contractAddress);
+  }
+}
+
+/**
+ * Schedule a WebSocket retry attempt.
+ */
+function scheduleWsRetry(
+  watcher: ChainWatcher,
+  wssUrl: string,
+  contractAddress: Address
+): void {
+  // Clear any existing timer
+  if (watcher.wsRetryTimer) {
+    clearTimeout(watcher.wsRetryTimer);
+  }
+
+  watcher.wsRetryTimer = setTimeout(() => {
+    if (watcher.transportType === "http") {
+      tryWebSocketReconnect(watcher, wssUrl, contractAddress);
+    }
+  }, WS_RETRY_INTERVAL_MS);
+}
+
 function setupChainWatcher(
   chainId: number,
   wssUrl: string,
@@ -317,55 +465,21 @@ function setupChainWatcher(
       watcher,
       () => {
         // ── Fallback: tear down WSS, switch to HTTP polling ──
-        console.warn(
-          `[Chain ${chainId}] \u26A0 eth_subscribe not supported, switching to HTTP polling`
-        );
-
-        // Unwatch all WSS listeners
         watcher.unwatchFns.forEach((fn) => fn());
         watcher.unwatchFns = [];
-
-        const httpUrl = deriveHttpUrl(wssUrl);
-
-        try {
-          const httpClient = createPublicClient({
-            transport: http(httpUrl, { batch: true }),
-            pollingInterval: 30_000,
-          });
-
-          watcher.unwatchFns = setupWatchers(
-            httpClient,
-            chainId,
-            contractAddress,
-            watcher
-            // no onSubscribeError — HTTP polling uses eth_getLogs, not eth_subscribe
-          );
-
-          watcher.transportType = "http";
-          watcher.status = "watching";
-          watcher.error = undefined;
-          console.log(
-            `[Chain ${chainId}] Watching contract ${contractAddress} (http poll)`
-          );
-        } catch (httpError) {
-          watcher.status = "error";
-          watcher.error = String(httpError);
-          console.error(
-            `[Chain ${chainId}] HTTP fallback failed:`,
-            httpError
-          );
-        }
+        switchToHttpPolling(watcher, wssUrl, contractAddress);
       }
     );
 
     watcher.status = "watching";
-    console.log(
-      `[Chain ${chainId}] Watching contract ${contractAddress} (ws)`
-    );
+    console.log(`[Chain ${chainId}] Watching contract ${contractAddress} (ws)`);
   } catch (error) {
     watcher.status = "error";
     watcher.error = String(error);
     console.error(`[Chain ${chainId}] Failed to set up watcher:`, error);
+
+    // Try HTTP fallback on initial connection failure too
+    switchToHttpPolling(watcher, wssUrl, contractAddress);
   }
 
   return watcher;
@@ -415,8 +529,11 @@ io.on("connection", (socket) => {
 async function shutdown() {
   console.log("[Server] Shutting down...");
 
-  // Unwatch all events across all chains
-  watchers.forEach((w) => w.unwatchFns.forEach((fn) => fn()));
+  // Unwatch all events and clear retry timers
+  watchers.forEach((w) => {
+    w.unwatchFns.forEach((fn) => fn());
+    if (w.wsRetryTimer) clearTimeout(w.wsRetryTimer);
+  });
 
   // Close Redis connection
   await closeRedisClient();

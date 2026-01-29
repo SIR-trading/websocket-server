@@ -223,12 +223,6 @@ async function writePositionToRedis(
     { score: 0, value: positionId }
   );
 
-  // User index (for fetching user's positions)
-  pipeline.sAdd(
-    `leaderboard:${chainId}:idx:user:${computed.user.toLowerCase()}`,
-    positionId
-  );
-
   // Full position metadata in hash
   const posData = {
     user: computed.user,
@@ -288,12 +282,6 @@ export async function removePositionFromRedis(
   );
   pipeline.zRem(
     `leaderboard:${chainId}:idx:pairlev:${pairKey}:${posData.leverageTier}`,
-    positionId
-  );
-
-  // Remove from user index
-  pipeline.sRem(
-    `leaderboard:${chainId}:idx:user:${posData.user.toLowerCase()}`,
     positionId
   );
 

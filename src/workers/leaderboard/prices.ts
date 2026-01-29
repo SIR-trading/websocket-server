@@ -128,6 +128,37 @@ async function fetchCoinGeckoPrices(
 }
 
 /**
+ * Fetch native token price using CoinGecko coin ID (e.g., "ethereum", "matic-network")
+ */
+async function fetchNativePrice(coinId: string): Promise<number> {
+  if (!coinId) return 0;
+
+  const headers: HeadersInit = { accept: "application/json" };
+  const apiKey = process.env.COINGECKO_API_KEY;
+  if (apiKey) {
+    headers["x-cg-demo-api-key"] = apiKey;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`,
+      { headers }
+    );
+
+    if (!response.ok) {
+      console.warn(`[Prices] CoinGecko native price returned ${response.status}`);
+      return 0;
+    }
+
+    const data = (await response.json()) as Record<string, { usd?: number }>;
+    return data[coinId]?.usd ?? 0;
+  } catch (error) {
+    console.error("[Prices] CoinGecko native price fetch failed:", error);
+    return 0;
+  }
+}
+
+/**
  * Fetch DEX prices for tokens not found on CoinGecko.
  * Gets token price in wrapped native, then converts to USD.
  */
@@ -281,6 +312,7 @@ export async function fetchPrices(
   });
 
   const priceMap: Record<string, number> = {};
+  const wrappedNativeLower = config.wrappedNative.toLowerCase();
 
   // Step 1: Try CoinGecko first for all tokens
   if (config.coingeckoPlatform) {
@@ -291,27 +323,24 @@ export async function fetchPrices(
     Object.assign(priceMap, cgPrices);
   }
 
+  // Step 2: Ensure wrapped native has a price (use coin ID if contract lookup failed)
+  if (!priceMap[wrappedNativeLower] && config.coingeckoNativeId) {
+    const nativePrice = await fetchNativePrice(config.coingeckoNativeId);
+    if (nativePrice > 0) {
+      priceMap[wrappedNativeLower] = nativePrice;
+    }
+  }
+
   // Find tokens still missing prices
   const missingTokens = tokenAddresses.filter(
     (t) => priceMap[t.toLowerCase()] === undefined
   );
 
-  // Step 2: Fallback to DEX for missing tokens
+  // Step 3: Fallback to DEX for missing tokens
   if (missingTokens.length > 0 && config.v3Factory) {
-    // Get wrapped native USD price from CoinGecko (needed for DEX conversion)
-    let wrappedNativeUsdPrice =
-      priceMap[config.wrappedNative.toLowerCase()];
+    const wrappedNativeUsdPrice = priceMap[wrappedNativeLower] ?? 0;
 
-    if (!wrappedNativeUsdPrice && config.coingeckoPlatform) {
-      const nativePrices = await fetchCoinGeckoPrices(
-        [config.wrappedNative],
-        config.coingeckoPlatform
-      );
-      wrappedNativeUsdPrice =
-        nativePrices[config.wrappedNative.toLowerCase()] ?? 0;
-    }
-
-    if (wrappedNativeUsdPrice && wrappedNativeUsdPrice > 0) {
+    if (wrappedNativeUsdPrice > 0) {
       const client = createPublicClient({
         chain: mainnet, // Chain doesn't affect RPC URL, just types
         transport: http(config.rpcUrl),

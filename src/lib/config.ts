@@ -6,6 +6,7 @@ export interface ChainConfig {
   assistantAddress: string;
   baseFee: number; // In decimal form (e.g., 0.1 = 10%)
   coingeckoPlatform?: string;
+  coingeckoNativeId?: string; // CoinGecko coin ID for native token (e.g., "ethereum")
   wrappedNative: string;
   wrappedNativeSymbol: string;
   v3Factory?: string;
@@ -21,6 +22,7 @@ const CHAIN_CONSTANTS: Record<
     v3Factory?: string;
     v3PoolInitCodeHash?: string;
     coingeckoPlatform?: string;
+    coingeckoNativeId?: string;
   }
 > = {
   1: {
@@ -30,6 +32,7 @@ const CHAIN_CONSTANTS: Record<
     v3PoolInitCodeHash:
       "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54",
     coingeckoPlatform: "ethereum",
+    coingeckoNativeId: "ethereum",
   },
   999: {
     wrappedNative: "0x5555555555555555555555555555555555555555",
@@ -38,6 +41,7 @@ const CHAIN_CONSTANTS: Record<
     v3PoolInitCodeHash:
       "0xe3572921be1688dba92df30c6781b8770499ff274d20ae9b325f4242634774fb",
     coingeckoPlatform: "hyperevm",
+    coingeckoNativeId: "hyperliquid", // HYPE token
   },
   6343: {
     wrappedNative: "0x4200000000000000000000000000000000000006",
@@ -45,7 +49,8 @@ const CHAIN_CONSTANTS: Record<
     v3Factory: "0x94996d371622304F2eB85df1eb7f328F7B317C3E",
     v3PoolInitCodeHash:
       "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54",
-    // No CoinGecko for MegaETH testnet
+    coingeckoNativeId: "ethereum", // MegaETH uses ETH
+    // No CoinGecko platform for MegaETH testnet
   },
 };
 

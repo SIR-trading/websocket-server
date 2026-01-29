@@ -67,6 +67,7 @@ leaderboard:{chainId}:zset:deposit   # ZSET: score=dollarTotal
 leaderboard:{chainId}:zset:value     # ZSET: score=currentValueUsd
 leaderboard:{chainId}:idx:pair:{collateral}:{debt}  # Filter index
 leaderboard:{chainId}:idx:lev:{tier}                # Filter index
+leaderboard:{chainId}:idx:user:{address}            # User's position IDs (SET)
 leaderboard:{chainId}:positions      # HASH: positionId → JSON metadata
 leaderboard:{chainId}:cursor         # STRING: last processed position ID
 leaderboard:{chainId}:timestamp      # STRING: last update time (ms)

@@ -138,10 +138,20 @@ export async function computeAndWritePositions(
       pos.vault.collateralToken.decimals
     );
 
-    const currentTokenPrice =
+    const currentPriceUsd =
       prices[pos.vault.collateralToken.id.toLowerCase()] ?? 0;
-    const currentPositionValueUsd = currentCollateralAmount * currentTokenPrice;
+    const currentPositionValueUsd = currentCollateralAmount * currentPriceUsd;
     const originalDepositValueUsd = parseFloat(pos.dollarTotal);
+
+    // Calculate entry price from original deposit / original collateral amount
+    const originalCollateralAmount = +formatUnits(
+      BigInt(pos.collateralTotal),
+      pos.vault.collateralToken.decimals
+    );
+    const entryPriceUsd =
+      originalCollateralAmount > 0
+        ? originalDepositValueUsd / originalCollateralAmount
+        : 0;
 
     const pnlUsd = currentPositionValueUsd - originalDepositValueUsd;
     const pnlUsdPercentage =
@@ -161,6 +171,8 @@ export async function computeAndWritePositions(
       pnlUsdPercentage,
       dollarTotal: originalDepositValueUsd,
       currentValueUsd: currentPositionValueUsd,
+      entryPriceUsd,
+      currentPriceUsd,
       createdAt: parseInt(pos.createdAt, 10),
     };
 
@@ -236,6 +248,8 @@ async function writePositionToRedis(
     pnlUsdPercentage: computed.pnlUsdPercentage,
     dollarTotal: computed.dollarTotal,
     currentValueUsd: computed.currentValueUsd,
+    entryPriceUsd: computed.entryPriceUsd,
+    currentPriceUsd: computed.currentPriceUsd,
     createdAt: computed.createdAt,
   };
   pipeline.hSet(

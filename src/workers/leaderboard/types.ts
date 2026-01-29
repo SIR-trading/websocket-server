@@ -41,6 +41,8 @@ export interface ComputedPositionData {
   pnlUsdPercentage: number;
   dollarTotal: number;
   currentValueUsd: number;
+  entryPriceUsd: number;
+  currentPriceUsd: number;
   createdAt: number;
 }
 

@@ -202,20 +202,18 @@ interface StakedPosition {
 }
 
 interface LpStakingStats {
-  totalLiquidity: bigint;
-  inRangeLiquidity: bigint;
-  totalValueStakedUsd: number;
-  inRangeValueStakedUsd: number;
-  lastTick: number;
-  lastUpdate: number;
+  totalSirAmount: bigint;
+  totalNativeAmount: bigint;
+  inRangeSirAmount: bigint;
+  inRangeNativeAmount: bigint;
+  currentTick: number;
+  lastTickUpdate: number;
 }
 
 interface ChainLpState {
   positions: Map<string, StakedPosition>;
   stats: LpStakingStats;
   isReady: boolean;
-  sirPrice: number;
-  wethPrice: number;
 }
 
 const lpStateByChain = new Map<number, ChainLpState>();
@@ -226,16 +224,14 @@ for (const config of lpStakingConfigs) {
   lpStateByChain.set(config.chainId, {
     positions: new Map(),
     stats: {
-      totalLiquidity: 0n,
-      inRangeLiquidity: 0n,
-      totalValueStakedUsd: 0,
-      inRangeValueStakedUsd: 0,
-      lastTick: 0,
-      lastUpdate: 0,
+      totalSirAmount: 0n,
+      totalNativeAmount: 0n,
+      inRangeSirAmount: 0n,
+      inRangeNativeAmount: 0n,
+      currentTick: 0,
+      lastTickUpdate: 0,
     },
     isReady: false,
-    sirPrice: 0,
-    wethPrice: 0,
   });
 }
 
@@ -329,31 +325,6 @@ function getTokenAmountsFromLiquidity(
   }
 
   return { amount0, amount1 };
-}
-
-function calculatePositionValueUsd(
-  position: StakedPosition,
-  currentTick: number,
-  sqrtPriceX96: bigint,
-  sirPrice: number,
-  wethPrice: number
-): { totalUsd: number; isInRange: boolean } {
-  const isInRange =
-    currentTick >= position.tickLower && currentTick < position.tickUpper;
-  const { amount0, amount1 } = getTokenAmountsFromLiquidity(
-    position.liquidity,
-    sqrtPriceX96,
-    position.tickLower,
-    position.tickUpper,
-    currentTick
-  );
-
-  // SIR is token0, WETH is token1 (assuming standard ordering)
-  const sirAmount = Number(amount0) / 1e18;
-  const wethAmount = Number(amount1) / 1e18;
-  const totalUsd = sirAmount * sirPrice + wethAmount * wethPrice;
-
-  return { totalUsd, isInRange };
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +790,7 @@ async function fetchPositionDetails(
 
 /**
  * Recalculate LP staking stats and broadcast to all clients
+ * Returns token amounts (not USD) - client calculates USD using current prices
  */
 async function recalcLpStatsAndBroadcast(chainId: number): Promise<void> {
   const state = lpStateByChain.get(chainId);
@@ -841,52 +813,58 @@ async function recalcLpStatsAndBroadcast(chainId: number): Promise<void> {
     const currentTick = slot0[1];
     const sqrtPriceX96 = slot0[0];
 
-    // Calculate totals
-    let totalValueStakedUsd = 0;
-    let inRangeValueStakedUsd = 0;
-    let totalLiquidity = 0n;
-    let inRangeLiquidity = 0n;
+    // Calculate token amounts (not USD)
+    let totalSirAmount = 0n;
+    let totalNativeAmount = 0n;
+    let inRangeSirAmount = 0n;
+    let inRangeNativeAmount = 0n;
 
     for (const position of state.positions.values()) {
       if (position.liquidity === 0n) continue;
 
-      totalLiquidity += position.liquidity;
-
-      const { totalUsd, isInRange } = calculatePositionValueUsd(
-        position,
-        currentTick,
+      const { amount0, amount1 } = getTokenAmountsFromLiquidity(
+        position.liquidity,
         sqrtPriceX96,
-        state.sirPrice,
-        state.wethPrice
+        position.tickLower,
+        position.tickUpper,
+        currentTick
       );
 
-      totalValueStakedUsd += totalUsd;
+      // SIR is token0, native (WETH/WHYPE) is token1
+      totalSirAmount += amount0;
+      totalNativeAmount += amount1;
+
+      const isInRange =
+        currentTick >= position.tickLower && currentTick < position.tickUpper;
       if (isInRange) {
-        inRangeValueStakedUsd += totalUsd;
-        inRangeLiquidity += position.liquidity;
+        inRangeSirAmount += amount0;
+        inRangeNativeAmount += amount1;
       }
     }
 
+    const now = Date.now();
     state.stats = {
-      totalLiquidity,
-      inRangeLiquidity,
-      totalValueStakedUsd,
-      inRangeValueStakedUsd,
-      lastTick: currentTick,
-      lastUpdate: Date.now(),
+      totalSirAmount,
+      totalNativeAmount,
+      inRangeSirAmount,
+      inRangeNativeAmount,
+      currentTick,
+      lastTickUpdate: now,
     };
 
-    // Broadcast to all clients
+    // Broadcast token amounts to all clients
     io.emit("lpStakingStatsUpdated", {
       chainId,
-      totalValueStakedUsd,
-      inRangeValueStakedUsd,
-      lastTick: currentTick,
-      timestamp: Date.now(),
+      totalSirAmount: totalSirAmount.toString(),
+      totalNativeAmount: totalNativeAmount.toString(),
+      inRangeSirAmount: inRangeSirAmount.toString(),
+      inRangeNativeAmount: inRangeNativeAmount.toString(),
+      currentTick,
+      lastTickUpdate: now,
     });
 
     console.log(
-      `[LP Stats] Chain ${chainId}: $${totalValueStakedUsd.toFixed(2)} total, $${inRangeValueStakedUsd.toFixed(2)} in-range`
+      `[LP Stats] Chain ${chainId}: SIR=${totalSirAmount.toString()}, native=${totalNativeAmount.toString()}`
     );
   } catch (error) {
     console.error(`[LP Stats] Error recalculating for chain ${chainId}:`, error);
@@ -1105,12 +1083,13 @@ async function initializeLpStaking(): Promise<void> {
     }
   }
 
-  // Set up periodic USD recalculation (every 5 minutes)
+  // Set up periodic tick refresh (every 5 minutes)
+  // This ensures token amounts are recalculated with current tick even if no stake/unstake events
   setInterval(
     async () => {
       for (const chainId of lpStakingEnabledChains) {
         const state = lpStateByChain.get(chainId);
-        if (state?.isReady && state.sirPrice > 0 && state.wethPrice > 0) {
+        if (state?.isReady) {
           await recalcLpStatsAndBroadcast(chainId);
         }
       }
@@ -1133,9 +1112,8 @@ app.get("/health", (_req, res) => {
       chainId,
       isReady: state?.isReady ?? false,
       positionCount: state?.positions.size ?? 0,
-      totalValueStakedUsd: state?.stats.totalValueStakedUsd ?? 0,
-      inRangeValueStakedUsd: state?.stats.inRangeValueStakedUsd ?? 0,
-      lastUpdate: state?.stats.lastUpdate ?? 0,
+      currentTick: state?.stats.currentTick ?? 0,
+      lastTickUpdate: state?.stats.lastTickUpdate ?? 0,
     };
   });
 
@@ -1167,54 +1145,41 @@ io.on("connection", (socket) => {
   // Send recent events to newly connected client
   socket.emit("recentEvents", recentEvents.slice(0, 10));
 
-  // Handler for LP staking stats request
+  // Handler for LP staking stats request - returns token amounts (not USD)
   socket.on("getLpStakingStats", ({ chainId }: { chainId: number }) => {
     if (!lpStakingEnabledChains.has(chainId)) {
       socket.emit("lpStakingStats", {
         chainId,
         supported: false,
-        totalValueStakedUsd: 0,
-        inRangeValueStakedUsd: 0,
+        loading: false,
+        totalSirAmount: "0",
+        totalNativeAmount: "0",
+        inRangeSirAmount: "0",
+        inRangeNativeAmount: "0",
+        currentTick: 0,
+        lastTickUpdate: 0,
       });
       return;
     }
 
     const state = lpStateByChain.get(chainId);
     if (!state?.isReady) {
-      socket.emit("lpStakingStats", { chainId, loading: true });
+      socket.emit("lpStakingStats", { chainId, loading: true, supported: true });
       return;
     }
 
     socket.emit("lpStakingStats", {
       chainId,
       supported: true,
-      totalValueStakedUsd: state.stats.totalValueStakedUsd,
-      inRangeValueStakedUsd: state.stats.inRangeValueStakedUsd,
-      lastTick: state.stats.lastTick,
-      timestamp: state.stats.lastUpdate,
+      loading: false,
+      totalSirAmount: state.stats.totalSirAmount.toString(),
+      totalNativeAmount: state.stats.totalNativeAmount.toString(),
+      inRangeSirAmount: state.stats.inRangeSirAmount.toString(),
+      inRangeNativeAmount: state.stats.inRangeNativeAmount.toString(),
+      currentTick: state.stats.currentTick,
+      lastTickUpdate: state.stats.lastTickUpdate,
     });
   });
-
-  // Handler to update prices (client sends prices, we store and recalc)
-  socket.on(
-    "updateLpPrices",
-    async ({
-      chainId,
-      sirPrice,
-      wethPrice,
-    }: {
-      chainId: number;
-      sirPrice: number;
-      wethPrice: number;
-    }) => {
-      const state = lpStateByChain.get(chainId);
-      if (state && sirPrice > 0 && wethPrice > 0) {
-        state.sirPrice = sirPrice;
-        state.wethPrice = wethPrice;
-        await recalcLpStatsAndBroadcast(chainId);
-      }
-    }
-  );
 
   socket.on("disconnect", (reason) => {
     console.log(

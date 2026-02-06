@@ -47,7 +47,8 @@ const CHAIN_CONSTANTS: Record<
     wrappedNativeSymbol: "WETH",
     v3Factory: "0x68b34591f662508076927803c567Cc8006988a09",
     v3PoolInitCodeHash: "0x851d77a45b8b9a205fb9f44cb829cceba85282714d2603d601840640628a3da7",
-    coingeckoNativeId: "megaeth",
+    coingeckoPlatform: "megaeth",
+    coingeckoNativeId: "ethereum",
   },
   6343: {
     wrappedNative: "0x4200000000000000000000000000000000000006",

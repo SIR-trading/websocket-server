@@ -242,6 +242,10 @@ async function writePositionToRedis(
     `leaderboard:${chainId}:idx:pairlev:${pairKey}:${computed.leverageTier}`,
     { score: 0, value: positionId }
   );
+  pipeline.zAdd(
+    `leaderboard:${chainId}:idx:user:${computed.user.toLowerCase()}`,
+    { score: 0, value: positionId }
+  );
 
   // Full position metadata in hash
   const posData = {
@@ -266,7 +270,81 @@ async function writePositionToRedis(
     JSON.stringify(posData)
   );
 
-  await pipeline.exec();
+  try {
+    await pipeline.exec();
+  } catch (error: unknown) {
+    // Handle WRONGTYPE errors from stale keys with wrong data type.
+    // When a key exists as a non-ZSET (e.g. from a previous deployment),
+    // zAdd fails with WRONGTYPE. Delete the bad key(s) and retry.
+    if (
+      error &&
+      typeof error === "object" &&
+      "errorIndexes" in error &&
+      "replies" in error
+    ) {
+      const { replies, errorIndexes } = error as {
+        replies: unknown[];
+        errorIndexes: number[];
+      };
+
+      // Collect keys that need deletion
+      const keysToDelete: string[] = [];
+      // Map pipeline command index → Redis key (must match order above)
+      const pipelineKeys = [
+        `leaderboard:${chainId}:zset:pnl`,
+        `leaderboard:${chainId}:zset:return`,
+        `leaderboard:${chainId}:zset:holding`,
+        `leaderboard:${chainId}:zset:deposit`,
+        `leaderboard:${chainId}:zset:value`,
+        `leaderboard:${chainId}:idx:pair:${pairKey}`,
+        `leaderboard:${chainId}:idx:lev:${computed.leverageTier}`,
+        `leaderboard:${chainId}:idx:pairlev:${pairKey}:${computed.leverageTier}`,
+        `leaderboard:${chainId}:idx:user:${computed.user.toLowerCase()}`,
+        `leaderboard:${chainId}:positions`,
+      ];
+
+      for (const idx of errorIndexes) {
+        const reply = replies[idx];
+        if (
+          reply &&
+          typeof reply === "object" &&
+          "message" in reply &&
+          typeof (reply as { message: string }).message === "string" &&
+          (reply as { message: string }).message.includes("WRONGTYPE")
+        ) {
+          if (idx < pipelineKeys.length) {
+            keysToDelete.push(pipelineKeys[idx]);
+          }
+        }
+      }
+
+      if (keysToDelete.length > 0) {
+        console.warn(
+          `[LeaderboardWorker] WRONGTYPE on keys: ${keysToDelete.join(", ")} — deleting and retrying`
+        );
+        for (const key of keysToDelete) {
+          await redis.del(key);
+        }
+        // Retry the full pipeline
+        const retry = redis.multi();
+        retry.zAdd(`leaderboard:${chainId}:zset:pnl`, { score: computed.pnlUsd, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:zset:return`, { score: computed.pnlUsdPercentage, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:zset:holding`, { score: computed.createdAt, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:zset:deposit`, { score: computed.dollarTotal, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:zset:value`, { score: computed.currentValueUsd, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:idx:pair:${pairKey}`, { score: 0, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:idx:lev:${computed.leverageTier}`, { score: 0, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:idx:pairlev:${pairKey}:${computed.leverageTier}`, { score: 0, value: positionId });
+        retry.zAdd(`leaderboard:${chainId}:idx:user:${computed.user.toLowerCase()}`, { score: 0, value: positionId });
+        retry.hSet(`leaderboard:${chainId}:positions`, positionId, JSON.stringify(posData));
+        await retry.exec();
+      } else {
+        throw error;
+      }
+    } else {
+      throw error;
+    }
+  }
 }
 
 /**
@@ -306,9 +384,29 @@ export async function removePositionFromRedis(
     `leaderboard:${chainId}:idx:pairlev:${pairKey}:${posData.leverageTier}`,
     positionId
   );
+  pipeline.zRem(
+    `leaderboard:${chainId}:idx:user:${posData.user.toLowerCase()}`,
+    positionId
+  );
 
   // Remove from hash
   pipeline.hDel(`leaderboard:${chainId}:positions`, positionId);
 
-  await pipeline.exec();
+  try {
+    await pipeline.exec();
+  } catch (error: unknown) {
+    // Swallow WRONGTYPE errors during removal — stale keys with wrong type
+    // will be cleaned up by writePositionToRedis on the next write cycle
+    if (
+      error &&
+      typeof error === "object" &&
+      "errorIndexes" in error
+    ) {
+      console.warn(
+        `[LeaderboardWorker] WRONGTYPE during position removal for ${positionId} — ignoring`
+      );
+    } else {
+      throw error;
+    }
+  }
 }

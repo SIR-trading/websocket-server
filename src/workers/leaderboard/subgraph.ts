@@ -130,3 +130,21 @@ export async function fetchAllVaultTokens(
   );
   return result.tokens;
 }
+
+// Query all vault IDs (for reserve caching)
+const VAULT_IDS_QUERY = gql`
+  query VaultIds {
+    vaults(first: 1000, orderBy: id, orderDirection: asc) {
+      id
+    }
+  }
+`;
+
+export async function fetchAllVaultIds(
+  client: GraphQLClient
+): Promise<number[]> {
+  const result = await client.request<{
+    vaults: Array<{ id: string }>;
+  }>(VAULT_IDS_QUERY);
+  return result.vaults.map((v) => parseInt(v.id, 16));
+}

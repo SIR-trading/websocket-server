@@ -2,11 +2,14 @@ import { randomUUID } from "crypto";
 import type { RedisClientType } from "redis";
 import { getRedisClient } from "../../lib/redis.js";
 import { getChainConfigs, type ChainConfig } from "../../lib/config.js";
+import { createPublicClient, http } from "viem";
+import { mainnet } from "viem/chains";
 import {
   createSubgraphClient,
   fetchPositionsBatch,
   fetchNewPositions,
   fetchAllVaultTokens,
+  fetchAllVaultIds,
 } from "./subgraph.js";
 import { fetchPrices } from "./prices.js";
 import {
@@ -15,6 +18,27 @@ import {
   removePositionFromRedis,
 } from "./compute.js";
 import type { WorkerStatus } from "./types.js";
+
+const AssistantABI = [
+  {
+    type: "function",
+    name: "getReserves",
+    inputs: [{ name: "vaultIds", type: "uint48[]", internalType: "uint48[]" }],
+    outputs: [
+      {
+        name: "reserves",
+        type: "tuple[]",
+        internalType: "struct SirStructs.Reserves[]",
+        components: [
+          { name: "reserveApes", type: "uint144", internalType: "uint144" },
+          { name: "reserveLPers", type: "uint144", internalType: "uint144" },
+          { name: "tickPriceX42", type: "int64", internalType: "int64" },
+        ],
+      },
+    ],
+    stateMutability: "view",
+  },
+] as const;
 
 const INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const LOCK_TTL = 600; // 10 minutes (longer than expected run time)
@@ -92,6 +116,18 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
         error
       );
       // Continue - stale Redis data is better than no data
+    }
+  }
+
+  // Phase 1.5: Cache reserves for all chains
+  for (const config of configs) {
+    try {
+      await cacheReservesForChain(config, redis);
+    } catch (error) {
+      console.error(
+        `[ReserveCache] Chain ${config.chainId} reserve caching failed:`,
+        error
+      );
     }
   }
 
@@ -219,6 +255,60 @@ async function cachePricesForChain(
 
   console.log(
     `[PriceCache] Chain ${chainId}: Cached ${Object.keys(prices).length} token prices`
+  );
+}
+
+/**
+ * Fetch all vault IDs from the subgraph, call getReserves on-chain,
+ * and write the result to Redis for the Next.js app to read.
+ */
+async function cacheReservesForChain(
+  config: ChainConfig,
+  redis: RedisClientType
+): Promise<void> {
+  const chainId = config.chainId;
+  const client = createSubgraphClient(
+    config.subgraphUrl,
+    config.subgraphApiKey
+  );
+
+  // Fetch all vault IDs from subgraph
+  const vaultIds = await fetchAllVaultIds(client);
+  if (vaultIds.length === 0) {
+    console.log(`[ReserveCache] Chain ${chainId}: No vaults found`);
+    return;
+  }
+
+  // Call getReserves on-chain
+  const viemClient = createPublicClient({
+    chain: mainnet,
+    transport: http(config.rpcUrl),
+  });
+
+  const result = await viemClient.readContract({
+    address: config.assistantAddress as `0x${string}`,
+    abi: AssistantABI,
+    functionName: "getReserves",
+    args: [vaultIds],
+  });
+
+  // Convert BigInts to strings for JSON serialization
+  const reserves = result.map((r, i) => ({
+    vaultId: vaultIds[i],
+    reserveApes: r.reserveApes.toString(),
+    reserveLPers: r.reserveLPers.toString(),
+    tickPriceX42: r.tickPriceX42.toString(),
+  }));
+
+  // Write to Redis with same key pattern as the API route
+  const sortedIds = [...vaultIds].sort((a, b) => a - b).join(",");
+  const cacheKey = `reserves:${chainId}:${sortedIds}`;
+  const responseBody = JSON.stringify({ reserves });
+
+  await redis.set(cacheKey, responseBody, { EX: 300 });
+
+  console.log(
+    `[ReserveCache] Chain ${chainId}: Cached reserves for ${vaultIds.length} vaults`
   );
 }
 

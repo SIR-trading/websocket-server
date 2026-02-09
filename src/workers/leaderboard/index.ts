@@ -17,6 +17,7 @@ import {
   filterPositions,
   removePositionFromRedis,
 } from "./compute.js";
+import { cacheVaultMetricsForChain } from "./vault-metrics.js";
 import type { WorkerStatus } from "./types.js";
 
 const AssistantABI = [
@@ -128,6 +129,16 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
         `[ReserveCache] Chain ${config.chainId} reserve caching failed:`,
         error
       );
+    }
+  }
+
+  // Phase 1.75: Cache vault metrics for all chains
+  for (const config of configs) {
+    try {
+      const client = createSubgraphClient(config.subgraphUrl, config.subgraphApiKey);
+      await cacheVaultMetricsForChain(config, client, redis);
+    } catch (error) {
+      console.error(`[VaultMetrics] Chain ${config.chainId} failed:`, error);
     }
   }
 

@@ -173,21 +173,12 @@ export async function cacheVaultMetricsForChain(
       }),
   ]);
 
-  console.log(
-    `[VaultMetrics] Chain ${chainId}: Subgraph returned ${apyResult.vaults.length} APY vaults, ${vaultsResult.vaults.length} metrics vaults`
-  );
-
   // Read prices from Redis (cached by earlier phase)
   let prices: Record<string, number> = {};
   try {
     const cached = await redis.get(`prices:${chainId}`);
     if (cached) {
       prices = JSON.parse(cached) as Record<string, number>;
-      console.log(
-        `[VaultMetrics] Chain ${chainId}: Loaded ${Object.keys(prices).length} token prices from Redis`
-      );
-    } else {
-      console.warn(`[VaultMetrics] Chain ${chainId}: No prices found in Redis`);
     }
   } catch {
     console.warn(
@@ -241,9 +232,6 @@ export async function cacheVaultMetricsForChain(
   }
 
   // Compute metrics for every vault
-  let vaultsWithFeesApy = 0;
-  let vaultsWithSirRewards = 0;
-  let vaultsWithVolatility = 0;
   const allMetrics: Record<string, VaultMetrics> = {};
 
   for (const vaultId of allVaultIds) {
@@ -262,10 +250,6 @@ export async function cacheVaultMetricsForChain(
 
     const totalApy = feesApy + sirRewardsApy;
 
-    if (feesApy > 0) vaultsWithFeesApy++;
-    if (sirRewardsApy > 0) vaultsWithSirRewards++;
-    if (volatility !== undefined) vaultsWithVolatility++;
-
     allMetrics[vaultId] = {
       apy: totalApy,
       feesApy,
@@ -275,11 +259,6 @@ export async function cacheVaultMetricsForChain(
       feesCount: 0,
     };
   }
-
-  console.log(
-    `[VaultMetrics] Chain ${chainId}: Computed ${allVaultIds.size} vaults — ` +
-    `${vaultsWithFeesApy} with feesApy, ${vaultsWithSirRewards} with sirRewards, ${vaultsWithVolatility} with volatility`
-  );
 
   // Atomic Redis write using tmp key + rename
   const tmpKey = `vault-metrics:${chainId}:tmp`;
@@ -302,8 +281,7 @@ export async function cacheVaultMetricsForChain(
     Math.floor(Date.now() / 1000).toString()
   );
 
-  const durationMs = Date.now() - startTime;
   console.log(
-    `[VaultMetrics] Chain ${chainId}: Cached metrics for ${Object.keys(allMetrics).length} vaults in ${durationMs}ms`
+    `[VaultMetrics] Chain ${chainId}: Cached metrics for ${Object.keys(allMetrics).length} vaults`
   );
 }

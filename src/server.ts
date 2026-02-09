@@ -92,10 +92,10 @@ const EVENTS = {
     "event AuctionStarted(address indexed token, uint256 amount)"
   ),
   BidReceived: parseAbiItem(
-    "event BidReceived(address indexed token, address indexed bidder, uint96 bid)"
+    "event BidReceived(address indexed bidder, address indexed token, uint96 previousBid, uint96 newBid)"
   ),
   AuctionedTokensSentToWinner: parseAbiItem(
-    "event AuctionedTokensSentToWinner(address indexed token, address indexed winner, uint256 amount)"
+    "event AuctionedTokensSentToWinner(address indexed winner, address indexed beneficiary, address indexed token, uint256 reward)"
   ),
   DividendsPaid: parseAbiItem(
     "event DividendsPaid(uint96 amountETH, uint80 amountStakedSIR)"
@@ -377,145 +377,96 @@ function addEvent(event: CachedEvent) {
 
 interface ChainWatcher {
   chainId: number;
-  transportType: "webSocket" | "http";
   status: "connecting" | "watching" | "error";
   error?: string;
-  unwatchFns: (() => void)[];
+  pollTimer?: ReturnType<typeof setInterval>;
 }
 
 const watchers: ChainWatcher[] = [];
 
+const POLL_INTERVAL_MS = 30_000;
+
+const CONTRACT_ABI = [
+  EVENTS.AuctionStarted,
+  EVENTS.BidReceived,
+  EVENTS.AuctionedTokensSentToWinner,
+  EVENTS.DividendsPaid,
+] as const;
+
 /**
- * Attach the 4 watchContractEvent listeners to a viem client.
- * Returns the array of unwatch functions.
+ * Process a log from the contract and emit it via Socket.IO.
  */
-function setupWatchers(
-  client: PublicClient<Transport>,
+function processLog(
   chainId: number,
-  contractAddress: Address,
-  watcher: ChainWatcher
-): (() => void)[] {
-  function handleError(eventName: string) {
-    return (error: Error) => {
-      console.error(`[Chain ${chainId}] ${eventName} watch error:`, error);
-      watcher.status = "error";
-      watcher.error = String(error);
-    };
+  log: { transactionHash: string | null; logIndex: number | null; blockNumber: bigint | null; eventName: string | undefined; args: Record<string, unknown> }
+) {
+  const id = `${chainId}-${log.transactionHash}-${log.logIndex}`;
+  const blockNumber = log.blockNumber ? Number(log.blockNumber) : 0;
+
+  switch (log.eventName) {
+    case "AuctionStarted":
+      addEvent({
+        id,
+        type: "auctionStarted",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          token: log.args.token,
+          amount: log.args.amount?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+        },
+      });
+      break;
+    case "BidReceived":
+      addEvent({
+        id,
+        type: "bidReceived",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          token: log.args.token,
+          bidder: log.args.bidder,
+          bid: log.args.newBid?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+        },
+      });
+      break;
+    case "AuctionedTokensSentToWinner":
+      addEvent({
+        id,
+        type: "auctionSettled",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          token: log.args.token,
+          winner: log.args.winner,
+          amount: log.args.reward?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+        },
+      });
+      break;
+    case "DividendsPaid":
+      addEvent({
+        id,
+        type: "dividendsPaid",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          amountETH: log.args.amountETH?.toString(),
+          amountStakedSIR: log.args.amountStakedSIR?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+        },
+      });
+      break;
   }
-
-  const fns: (() => void)[] = [];
-
-  // Watch AuctionStarted
-  fns.push(
-    client.watchContractEvent({
-      address: contractAddress,
-      abi: [EVENTS.AuctionStarted],
-      eventName: "AuctionStarted",
-      onLogs: (logs) => {
-        logs.forEach((log) => {
-          addEvent({
-            id: `${chainId}-${log.transactionHash}-${log.logIndex}`,
-            type: "auctionStarted",
-            chainId,
-            timestamp: Date.now(),
-            data: {
-              chainId,
-              token: log.args.token,
-              amount: log.args.amount?.toString(),
-              txHash: log.transactionHash,
-              blockNumber: Number(log.blockNumber),
-            },
-          });
-        });
-      },
-      onError: handleError("AuctionStarted"),
-    })
-  );
-
-  // Watch BidReceived
-  fns.push(
-    client.watchContractEvent({
-      address: contractAddress,
-      abi: [EVENTS.BidReceived],
-      eventName: "BidReceived",
-      onLogs: (logs) => {
-        logs.forEach((log) => {
-          addEvent({
-            id: `${chainId}-${log.transactionHash}-${log.logIndex}`,
-            type: "bidReceived",
-            chainId,
-            timestamp: Date.now(),
-            data: {
-              chainId,
-              token: log.args.token,
-              bidder: log.args.bidder,
-              bid: log.args.bid?.toString(),
-              txHash: log.transactionHash,
-              blockNumber: Number(log.blockNumber),
-            },
-          });
-        });
-      },
-      onError: handleError("BidReceived"),
-    })
-  );
-
-  // Watch AuctionedTokensSentToWinner
-  fns.push(
-    client.watchContractEvent({
-      address: contractAddress,
-      abi: [EVENTS.AuctionedTokensSentToWinner],
-      eventName: "AuctionedTokensSentToWinner",
-      onLogs: (logs) => {
-        logs.forEach((log) => {
-          addEvent({
-            id: `${chainId}-${log.transactionHash}-${log.logIndex}`,
-            type: "auctionSettled",
-            chainId,
-            timestamp: Date.now(),
-            data: {
-              chainId,
-              token: log.args.token,
-              winner: log.args.winner,
-              amount: log.args.amount?.toString(),
-              txHash: log.transactionHash,
-              blockNumber: Number(log.blockNumber),
-            },
-          });
-        });
-      },
-      onError: handleError("AuctionedTokensSentToWinner"),
-    })
-  );
-
-  // Watch DividendsPaid
-  fns.push(
-    client.watchContractEvent({
-      address: contractAddress,
-      abi: [EVENTS.DividendsPaid],
-      eventName: "DividendsPaid",
-      onLogs: (logs) => {
-        logs.forEach((log) => {
-          addEvent({
-            id: `${chainId}-${log.transactionHash}-${log.logIndex}`,
-            type: "dividendsPaid",
-            chainId,
-            timestamp: Date.now(),
-            data: {
-              chainId,
-              amountETH: log.args.amountETH?.toString(),
-              amountStakedSIR: log.args.amountStakedSIR?.toString(),
-              txHash: log.transactionHash,
-              blockNumber: Number(log.blockNumber),
-            },
-          });
-        });
-      },
-      onError: handleError("DividendsPaid"),
-    })
-  );
-
-  return fns;
 }
 
 function setupChainWatcher(
@@ -525,31 +476,64 @@ function setupChainWatcher(
 ): ChainWatcher {
   const watcher: ChainWatcher = {
     chainId,
-    transportType: "http",
     status: "connecting",
-    unwatchFns: [],
   };
 
-  try {
-    const httpClient = createPublicClient({
-      transport: http(rpcUrl, { batch: true }),
-      pollingInterval: 30_000,
-    });
+  const client = createPublicClient({
+    transport: http(rpcUrl, { batch: true }),
+  });
 
-    watcher.unwatchFns = setupWatchers(
-      httpClient,
-      chainId,
-      contractAddress,
-      watcher
-    );
+  let lastBlock = 0n;
 
-    watcher.status = "watching";
-    console.log(`[Chain ${chainId}] Watching contract ${contractAddress} (http poll)`);
-  } catch (error) {
-    watcher.status = "error";
-    watcher.error = String(error);
-    console.error(`[Chain ${chainId}] Failed to set up watcher:`, error);
+  async function poll() {
+    try {
+      const currentBlock = await client.getBlockNumber();
+
+      // First poll: just record the block, don't fetch historical logs
+      if (lastBlock === 0n) {
+        lastBlock = currentBlock;
+        watcher.status = "watching";
+        console.log(`[Chain ${chainId}] Watching contract ${contractAddress} from block ${currentBlock}`);
+        return;
+      }
+
+      // No new blocks since last poll
+      if (currentBlock <= lastBlock) return;
+
+      const fromBlock = lastBlock + 1n;
+      const logs = await client.getContractEvents({
+        address: contractAddress,
+        abi: CONTRACT_ABI,
+        fromBlock,
+        toBlock: currentBlock,
+      });
+
+      if (logs.length > 0) {
+        console.log(`[Chain ${chainId}] Found ${logs.length} event(s) in blocks ${fromBlock}-${currentBlock}`);
+      }
+
+      for (const log of logs) {
+        processLog(chainId, log as never);
+      }
+
+      lastBlock = currentBlock;
+
+      // Clear error state on successful poll
+      if (watcher.status === "error") {
+        watcher.status = "watching";
+        watcher.error = undefined;
+        console.log(`[Chain ${chainId}] Recovered, watching again`);
+      }
+    } catch (error) {
+      console.error(`[Chain ${chainId}] Poll error:`, error);
+      watcher.status = "error";
+      watcher.error = String(error);
+    }
   }
+
+  // Initial poll, then repeat on interval
+  void poll();
+  watcher.pollTimer = setInterval(() => void poll(), POLL_INTERVAL_MS);
 
   return watcher;
 }
@@ -926,7 +910,6 @@ app.get("/health", (_req, res) => {
     uptime: process.uptime(),
     chains: watchers.map((w) => ({
       chainId: w.chainId,
-      transport: w.transportType,
       status: w.status,
       ...(w.error ? { error: w.error } : {}),
     })),
@@ -998,9 +981,9 @@ io.on("connection", (socket) => {
 async function shutdown() {
   console.log("[Server] Shutting down...");
 
-  // Unwatch all events
+  // Stop all poll timers
   watchers.forEach((w) => {
-    w.unwatchFns.forEach((fn) => fn());
+    if (w.pollTimer) clearInterval(w.pollTimer);
   });
 
   // Clean up LP staking watchers

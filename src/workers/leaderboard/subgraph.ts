@@ -104,3 +104,29 @@ export async function fetchNewPositions(
 
   return result.apePositions;
 }
+
+// Query all unique tokens across all vaults (for centralized price caching)
+const VAULT_TOKENS_QUERY = gql`
+  query VaultTokens {
+    tokens(first: 1000, orderBy: vaultCount, orderDirection: desc) {
+      id
+      symbol
+      decimals
+    }
+  }
+`;
+
+export interface VaultToken {
+  id: string;
+  symbol: string;
+  decimals: number;
+}
+
+export async function fetchAllVaultTokens(
+  client: GraphQLClient
+): Promise<VaultToken[]> {
+  const result = await client.request<{ tokens: VaultToken[] }>(
+    VAULT_TOKENS_QUERY
+  );
+  return result.tokens;
+}

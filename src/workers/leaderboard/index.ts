@@ -6,8 +6,9 @@ import {
   createSubgraphClient,
   fetchPositionsBatch,
   fetchNewPositions,
+  fetchAllVaultTokens,
 } from "./subgraph.js";
-import { fetchPrices, getUniqueTokens } from "./prices.js";
+import { fetchPrices } from "./prices.js";
 import {
   computeAndWritePositions,
   filterPositions,
@@ -81,6 +82,20 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
 
   console.log("[LeaderboardWorker] Starting cycle...");
 
+  // Phase 1: Cache prices for all chains (used by both Next.js app and leaderboard)
+  for (const config of configs) {
+    try {
+      await cachePricesForChain(config, redis);
+    } catch (error) {
+      console.error(
+        `[PriceCache] Chain ${config.chainId} price caching failed:`,
+        error
+      );
+      // Continue - stale Redis data is better than no data
+    }
+  }
+
+  // Phase 2: Process leaderboard positions per chain
   for (const config of configs) {
     const chainId = config.chainId;
     workerStatus.chainStatus[chainId] = { status: "running" };
@@ -148,6 +163,84 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
   scheduleNextRun(configs);
 }
 
+/**
+ * Fetch all vault tokens from the subgraph, add SIR + wrapped native,
+ * fetch prices via CoinGecko/DEX, and write the full price map to Redis.
+ * The Next.js app reads from this cache instead of calling CoinGecko directly.
+ */
+async function cachePricesForChain(
+  config: ChainConfig,
+  redis: RedisClientType
+): Promise<void> {
+  const chainId = config.chainId;
+  const client = createSubgraphClient(config.subgraphUrl, config.subgraphApiKey);
+
+  // 1. Fetch all unique vault tokens from the subgraph
+  const vaultTokens = await fetchAllVaultTokens(client);
+  const tokens = new Map<string, { decimals: number }>();
+
+  for (const token of vaultTokens) {
+    tokens.set(token.id.toLowerCase(), { decimals: token.decimals });
+  }
+
+  // 2. Ensure SIR token is included
+  if (config.sirTokenAddress) {
+    const sirAddr = config.sirTokenAddress.toLowerCase();
+    if (!tokens.has(sirAddr)) {
+      tokens.set(sirAddr, { decimals: 12 }); // SIR has 12 decimals
+    }
+  }
+
+  // 3. Ensure wrapped native is included
+  const wrappedNativeLower = config.wrappedNative.toLowerCase();
+  if (!tokens.has(wrappedNativeLower)) {
+    tokens.set(wrappedNativeLower, { decimals: 18 });
+  }
+
+  if (tokens.size === 0) {
+    console.log(`[PriceCache] Chain ${chainId}: No tokens to price`);
+    return;
+  }
+
+  // 4. Fetch prices (CoinGecko → DEX fallback)
+  const prices = await fetchPrices(config, tokens);
+
+  // 5. Guard: only write if we got at least some prices
+  if (Object.keys(prices).length === 0) {
+    console.warn(
+      `[PriceCache] Chain ${chainId}: Got empty prices, keeping existing cache`
+    );
+    return;
+  }
+
+  // 6. Write to Redis (no TTL - stale reads are better than no reads)
+  await redis.set(`prices:${chainId}`, JSON.stringify(prices));
+  await redis.set(`prices:${chainId}:updatedAt`, Date.now().toString());
+
+  console.log(
+    `[PriceCache] Chain ${chainId}: Cached ${Object.keys(prices).length} token prices`
+  );
+}
+
+/**
+ * Read cached prices from Redis for a given chain.
+ * Returns empty map if not available.
+ */
+async function getCachedPrices(
+  chainId: number,
+  redis: RedisClientType
+): Promise<Record<string, number>> {
+  try {
+    const cached = await redis.get(`prices:${chainId}`);
+    if (cached) {
+      return JSON.parse(cached) as Record<string, number>;
+    }
+  } catch (error) {
+    console.warn(`[PriceCache] Chain ${chainId}: Failed to read cache:`, error);
+  }
+  return {};
+}
+
 async function computeLeaderboardForChain(
   config: ChainConfig,
   redis: RedisClientType
@@ -156,6 +249,9 @@ async function computeLeaderboardForChain(
   const client = createSubgraphClient(config.subgraphUrl, config.subgraphApiKey);
 
   let totalProcessed = 0;
+
+  // Read cached prices (written by cachePricesForChain earlier in the cycle)
+  const prices = await getCachedPrices(chainId, redis);
 
   // 1. First, process any NEW positions (created since last full sweep)
   const lastSweepStr = await redis.get(`leaderboard:${chainId}:lastSweep`);
@@ -170,8 +266,6 @@ async function computeLeaderboardForChain(
 
       const filtered = filterPositions(newPositions);
       if (filtered.length > 0) {
-        const uniqueTokens = getUniqueTokens(filtered);
-        const prices = await fetchPrices(config, uniqueTokens);
         const processed = await computeAndWritePositions(
           filtered,
           chainId,
@@ -207,11 +301,7 @@ async function computeLeaderboardForChain(
     }
 
     if (filtered.length > 0) {
-      // Fetch prices once for this batch (deduplicated by token address)
-      const uniqueTokens = getUniqueTokens(filtered);
-      const prices = await fetchPrices(config, uniqueTokens);
-
-      // Process positions
+      // Process positions using cached prices
       const processed = await computeAndWritePositions(
         filtered,
         chainId,

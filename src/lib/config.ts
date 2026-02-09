@@ -11,6 +11,7 @@ export interface ChainConfig {
   wrappedNativeSymbol: string;
   v3Factory?: string;
   v3PoolInitCodeHash?: string;
+  sirTokenAddress?: string; // SIR token address on this chain
 }
 
 // Chain-specific constants (from App's prices API)
@@ -88,6 +89,7 @@ export function getChainConfigs(): ChainConfig[] {
   const subgraphApiKey = process.env.SUBGRAPH_API_KEY;
   const assistantAddresses = process.env.ASSISTANT_ADDRESSES?.split(",");
   const baseFees = process.env.BASE_FEES?.split(",").map(Number);
+  const sirTokenAddresses = process.env.SIR_CONTRACT_ADDRESSES?.split(",");
 
   if (chainIds.length === 0) {
     console.error("[Config] CHAIN_IDS not set");
@@ -125,6 +127,7 @@ export function getChainConfigs(): ChainConfig[] {
         "",
       baseFee:
         baseFees?.[i] ?? DEFAULT_BASE_FEES[chainId] ?? 0.1,
+      sirTokenAddress: sirTokenAddresses?.[i]?.trim() || undefined,
       ...constants,
     };
   });

@@ -39,7 +39,7 @@ const VAULT_UNCLAIMED_REWARDS_ABI = [
     type: "function",
     name: "unclaimedRewards",
     inputs: [
-      { name: "vaultId", type: "uint48" },
+      { name: "vaultId", type: "uint256" },
       { name: "lper", type: "address" },
     ],
     outputs: [{ name: "", type: "uint80" }],

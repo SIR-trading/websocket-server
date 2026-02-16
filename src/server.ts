@@ -24,7 +24,7 @@ import { closeRedisClient } from "./lib/redis.js";
 
 const PORT = process.env.PORT ?? 8080;
 const FRONTEND_URLS =
-  process.env.FRONTEND_URLS?.split(",") ?? ["http://localhost:3000"];
+  process.env.FRONTEND_URLS?.split(",").map((s) => s.trim()) ?? ["http://localhost:3000"];
 
 const CHAIN_IDS = process.env.CHAIN_IDS?.split(",").map(Number) ?? [];
 const RPC_URLS = process.env.RPC_URLS?.split(",") ?? [];

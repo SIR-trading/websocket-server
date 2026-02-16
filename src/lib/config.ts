@@ -4,6 +4,7 @@ export interface ChainConfig {
   subgraphUrl: string;
   subgraphApiKey?: string;
   assistantAddress: string;
+  vaultAddress: string;
   baseFee: number; // In decimal form (e.g., 0.1 = 10%)
   coingeckoPlatform?: string;
   coingeckoNativeId?: string; // CoinGecko coin ID for native token (e.g., "ethereum")
@@ -70,6 +71,14 @@ const DEFAULT_ASSISTANT_ADDRESSES: Record<number, string> = {
   6343: "0x1642ceF4498B811f5F765b4FE5D3263fE26a1F9A",
 };
 
+// Default vault addresses (from build-data.json)
+const DEFAULT_VAULT_ADDRESSES: Record<number, string> = {
+  1: "0x20950a5e47C958109dA40F1a6C046F498e9B2e02",
+  999: "0xf86e3C72e28962dEE945f6152483338c93e3483E",
+  4326: "0xF62e8a26241B8E6BB35F11589D4bC2C0d4192C1F",
+  6343: "0xa9c54405849aFEC80976cD4eBC52540Bec5E476c",
+};
+
 // Default base fees (from build-data.json)
 const DEFAULT_BASE_FEES: Record<number, number> = {
   1: 0.1,
@@ -88,6 +97,7 @@ export function getChainConfigs(): ChainConfig[] {
   const subgraphUrls = process.env.SUBGRAPH_URLS?.split(",") ?? [];
   const subgraphApiKey = process.env.SUBGRAPH_API_KEY;
   const assistantAddresses = process.env.ASSISTANT_ADDRESSES?.split(",");
+  const vaultAddresses = process.env.VAULT_ADDRESSES?.split(",");
   const baseFees = process.env.BASE_FEES?.split(",").map(Number);
   const sirTokenAddresses = process.env.SIR_CONTRACT_ADDRESSES?.split(",");
 
@@ -124,6 +134,10 @@ export function getChainConfigs(): ChainConfig[] {
       assistantAddress:
         assistantAddresses?.[i]?.trim() ||
         DEFAULT_ASSISTANT_ADDRESSES[chainId] ||
+        "",
+      vaultAddress:
+        vaultAddresses?.[i]?.trim() ||
+        DEFAULT_VAULT_ADDRESSES[chainId] ||
         "",
       baseFee:
         baseFees?.[i] ?? DEFAULT_BASE_FEES[chainId] ?? 0.1,

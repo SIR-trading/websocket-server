@@ -69,6 +69,52 @@ export interface ActiveLeaderboardResponse {
 
 export type SortField = "pnl" | "return" | "holding" | "deposit" | "value";
 
+export interface CurrentTeaPositionFragment {
+  id: string;
+  user: string;
+  collateralTotal: string;
+  dollarTotal: string;
+  debtTokenTotal: string;
+  balance: string;
+  lockEnd: string;
+  claimedSir: string;
+  createdAt: string;
+  vault: {
+    id: string;
+    leverageTier: number;
+    teaSupply: string;
+    collateralToken: {
+      id: string;
+      symbol: string | null;
+      decimals: number;
+    };
+    debtToken: {
+      id: string;
+      symbol: string | null;
+      decimals: number;
+    };
+  };
+}
+
+export interface ComputedTeaPositionData {
+  user: string;
+  vaultId: string;
+  leverageTier: number;
+  collateralSymbol: string;
+  debtSymbol: string;
+  collateralToken: string;
+  debtToken: string;
+  currentValueUsd: number;
+  dollarTotal: number;
+  pnlUsd: number;
+  pnlUsdPercentage: number;
+  lockEnd: number;
+  totalSir: number;
+  createdAt: number;
+}
+
+export type LpSortField = "value" | "pnl" | "return" | "sir" | "holding";
+
 export interface WorkerStatus {
   enabled: boolean;
   lastRun: number | null;

@@ -1,5 +1,5 @@
 import { GraphQLClient, gql } from "graphql-request";
-import type { CurrentApePositionFragment } from "./types.js";
+import type { CurrentApePositionFragment, CurrentTeaPositionFragment } from "./types.js";
 
 const CURRENT_APE_POSITION_FIELDS = gql`
   fragment CurrentApePositionFields on ApePosition {
@@ -103,6 +103,93 @@ export async function fetchNewPositions(
   });
 
   return result.apePositions;
+}
+
+// TEA position queries
+
+const CURRENT_TEA_POSITION_FIELDS = gql`
+  fragment CurrentTeaPositionFields on TeaPosition {
+    id
+    user
+    collateralTotal
+    dollarTotal
+    debtTokenTotal
+    balance
+    lockEnd
+    claimedSir
+    createdAt
+    vault {
+      id
+      leverageTier
+      teaSupply
+      collateralToken {
+        id
+        symbol
+        decimals
+      }
+      debtToken {
+        id
+        symbol
+        decimals
+      }
+    }
+  }
+`;
+
+const ACTIVE_TEA_POSITIONS_QUERY = gql`
+  ${CURRENT_TEA_POSITION_FIELDS}
+  query ActiveTeaPositions($first: Int!, $lastId: String!) {
+    teaPositions(
+      first: $first
+      orderBy: id
+      orderDirection: asc
+      where: { id_gt: $lastId }
+    ) {
+      ...CurrentTeaPositionFields
+    }
+  }
+`;
+
+const NEW_TEA_POSITIONS_QUERY = gql`
+  ${CURRENT_TEA_POSITION_FIELDS}
+  query NewTeaPositions($createdAfter: Int!, $first: Int!) {
+    teaPositions(
+      first: $first
+      orderBy: createdAt
+      orderDirection: asc
+      where: { createdAt_gt: $createdAfter }
+    ) {
+      ...CurrentTeaPositionFields
+    }
+  }
+`;
+
+export async function fetchTeaPositionsBatch(
+  client: GraphQLClient,
+  cursor: string,
+  limit: number
+): Promise<CurrentTeaPositionFragment[]> {
+  const result = await client.request<{
+    teaPositions: CurrentTeaPositionFragment[];
+  }>(ACTIVE_TEA_POSITIONS_QUERY, {
+    first: limit,
+    lastId: cursor,
+  });
+  return result.teaPositions;
+}
+
+export async function fetchNewTeaPositions(
+  client: GraphQLClient,
+  createdAfterTimestamp: number,
+  limit: number = 500
+): Promise<CurrentTeaPositionFragment[]> {
+  const result = await client.request<{
+    teaPositions: CurrentTeaPositionFragment[];
+  }>(NEW_TEA_POSITIONS_QUERY, {
+    createdAfter: createdAfterTimestamp,
+    first: limit,
+  });
+  return result.teaPositions;
 }
 
 // Query all unique tokens across all vaults (for centralized price caching)

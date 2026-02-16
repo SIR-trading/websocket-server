@@ -6,6 +6,8 @@ import {
   createSubgraphClient,
   fetchPositionsBatch,
   fetchNewPositions,
+  fetchTeaPositionsBatch,
+  fetchNewTeaPositions,
   fetchAllVaultTokens,
 } from "./subgraph.js";
 import { fetchPrices } from "./prices.js";
@@ -14,6 +16,11 @@ import {
   filterPositions,
   removePositionFromRedis,
 } from "./compute.js";
+import {
+  computeAndWriteTeaPositions,
+  filterTeaPositions,
+  removeTeaPositionFromRedis,
+} from "./tea-compute.js";
 import { cacheVaultMetricsForChain } from "./vault-metrics.js";
 import type { WorkerStatus } from "./types.js";
 
@@ -157,6 +164,46 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
         const currentToken = await redis.get(lockKey);
         if (currentToken === lockToken) {
           await redis.del(lockKey);
+        }
+      } catch {
+        // Ignore lock release errors
+      }
+    }
+  }
+
+  // Phase 3: Process TEA/LP positions per chain
+  for (const config of configs) {
+    const chainId = config.chainId;
+    const lpLockKey = `leaderboard:${chainId}:lp:worker:lock`;
+    const lpLockToken = randomUUID();
+
+    try {
+      const acquired = await redis.set(lpLockKey, lpLockToken, {
+        NX: true,
+        EX: LOCK_TTL,
+      });
+
+      if (!acquired) {
+        console.log(
+          `[LeaderboardWorker] Chain ${chainId}: LP lock held by another instance`
+        );
+        continue;
+      }
+
+      const teaProcessed = await computeTeaLeaderboardForChain(config, redis);
+      console.log(
+        `[LeaderboardWorker] Chain ${chainId}: Processed ${teaProcessed} TEA positions`
+      );
+    } catch (error) {
+      console.error(
+        `[LeaderboardWorker] Chain ${chainId} TEA failed:`,
+        error
+      );
+    } finally {
+      try {
+        const currentToken = await redis.get(lpLockKey);
+        if (currentToken === lpLockToken) {
+          await redis.del(lpLockKey);
         }
       } catch {
         // Ignore lock release errors
@@ -344,6 +391,104 @@ async function computeLeaderboardForChain(
   // 4. Update timestamp
   await redis.set(
     `leaderboard:${chainId}:timestamp`,
+    Date.now().toString()
+  );
+
+  return totalProcessed;
+}
+
+async function computeTeaLeaderboardForChain(
+  config: ChainConfig,
+  redis: RedisClientType
+): Promise<number> {
+  const chainId = config.chainId;
+  const client = createSubgraphClient(
+    config.subgraphUrl,
+    config.subgraphApiKey
+  );
+  let totalProcessed = 0;
+
+  const prices = await getCachedPrices(chainId, redis);
+
+  // 1. Process NEW TEA positions since last sweep
+  const lastSweepStr = await redis.get(
+    `leaderboard:${chainId}:lp:lastSweep`
+  );
+  if (lastSweepStr) {
+    const lastSweepTime = parseInt(lastSweepStr, 10);
+    const newPositions = await fetchNewTeaPositions(client, lastSweepTime);
+
+    if (newPositions.length > 0) {
+      console.log(
+        `[LeaderboardWorker] Chain ${chainId}: Processing ${newPositions.length} new TEA positions`
+      );
+      const filtered = filterTeaPositions(newPositions);
+      if (filtered.length > 0) {
+        const processed = await computeAndWriteTeaPositions(
+          filtered,
+          chainId,
+          config,
+          redis,
+          prices
+        );
+        totalProcessed += processed;
+      }
+    }
+  }
+
+  // 2. Continue incremental sweep from cursor
+  const cursor =
+    (await redis.get(`leaderboard:${chainId}:lp:cursor`)) ?? "";
+
+  const positions = await fetchTeaPositionsBatch(
+    client,
+    cursor,
+    MAX_POSITIONS_PER_RUN
+  );
+
+  if (positions.length > 0) {
+    const filtered = filterTeaPositions(positions);
+
+    // Remove closed positions (balance = 0)
+    const closedPositions = positions.filter(
+      (p) => BigInt(p.balance) === 0n
+    );
+    for (const pos of closedPositions) {
+      await removeTeaPositionFromRedis(pos.id, chainId, redis);
+    }
+
+    if (filtered.length > 0) {
+      const processed = await computeAndWriteTeaPositions(
+        filtered,
+        chainId,
+        config,
+        redis,
+        prices
+      );
+      totalProcessed += processed;
+    }
+  }
+
+  // 3. Update cursor; if sweep complete, record timestamp
+  if (positions.length < MAX_POSITIONS_PER_RUN) {
+    await redis.del(`leaderboard:${chainId}:lp:cursor`);
+    await redis.set(
+      `leaderboard:${chainId}:lp:lastSweep`,
+      Math.floor(Date.now() / 1000).toString()
+    );
+    console.log(
+      `[LeaderboardWorker] Chain ${chainId}: TEA full sweep complete`
+    );
+  } else {
+    await redis.set(
+      `leaderboard:${chainId}:lp:cursor`,
+      positions[positions.length - 1].id
+    );
+  }
+
+  // 4. Update timestamp
+  await redis.set(
+    `leaderboard:${chainId}:lp:timestamp`,
     Date.now().toString()
   );
 

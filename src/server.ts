@@ -32,6 +32,11 @@ const SIR_CONTRACT_ADDRESSES = (process.env.SIR_CONTRACT_ADDRESSES?.split(
   ","
 ) ?? []) as Address[];
 
+// Vault contract addresses for activity event watching
+const VAULT_CONTRACT_ADDRESSES = (process.env.VAULT_ADDRESSES?.split(
+  ","
+) ?? []) as Address[];
+
 if (
   CHAIN_IDS.length === 0 ||
   CHAIN_IDS.length !== RPC_URLS.length ||
@@ -41,6 +46,12 @@ if (
     "CHAIN_IDS, RPC_URLS, and SIR_CONTRACT_ADDRESSES must all be provided with the same number of comma-separated values"
   );
   process.exit(1);
+}
+
+if (VAULT_CONTRACT_ADDRESSES.length > 0 && VAULT_CONTRACT_ADDRESSES.length !== CHAIN_IDS.length) {
+  console.warn(
+    "[Activity] VAULT_ADDRESSES count must match CHAIN_IDS count - activity feed disabled"
+  );
 }
 
 // LP Staking environment variables
@@ -100,7 +111,39 @@ const EVENTS = {
   DividendsPaid: parseAbiItem(
     "event DividendsPaid(uint96 amountETH, uint80 amountStakedSIR)"
   ),
+  // Staking events on Sir contract
+  Staked: parseAbiItem(
+    "event Staked(address indexed staker, uint80 amount)"
+  ),
+  Unstaked: parseAbiItem(
+    "event Unstaked(address indexed staker, uint80 amount)"
+  ),
+  DividendsClaimed: parseAbiItem(
+    "event DividendsClaimed(address indexed staker, uint96 amount)"
+  ),
+  RewardsClaimed: parseAbiItem(
+    "event RewardsClaimed(address indexed contributor, uint256 indexed vaultId, uint80 rewards)"
+  ),
 };
+
+// Vault contract events (Mint has two variants for cross-chain compat)
+const VAULT_EVENTS = {
+  MintLegacy: parseAbiItem(
+    "event Mint(uint48 indexed vaultId, address indexed minter, bool isAPE, uint144 collateralIn, uint144 collateralFeeToStakers, uint144 collateralFeeToLPers, uint256 tokenOut)"
+  ),
+  MintNew: parseAbiItem(
+    "event Mint(uint48 indexed vaultId, address indexed minter, bool isAPE, uint144 collateralIn, uint144 collateralFeeToStakers, uint144 collateralFeeToLPers, uint256 tokenOut, uint8 portionLockTime)"
+  ),
+  Burn: parseAbiItem(
+    "event Burn(uint48 indexed vaultId, address indexed burner, bool isAPE, uint256 tokenIn, uint144 collateralWithdrawn, uint144 collateralFeeToStakers, uint144 collateralFeeToLPers)"
+  ),
+  VaultInitialized: parseAbiItem(
+    "event VaultInitialized(address indexed debtToken, address indexed collateralToken, int8 indexed leverageTier, uint256 vaultId, address ape)"
+  ),
+};
+
+// Networks that use the old Mint event (without portionLockTime parameter)
+const LEGACY_MINT_CHAIN_IDS = new Set([1, 11155111, 999]);
 
 // ---------------------------------------------------------------------------
 // LP Staking event ABIs and contract ABIs
@@ -357,6 +400,7 @@ interface CachedEvent {
 }
 
 const recentEvents: CachedEvent[] = [];
+const recentActivities: CachedEvent[] = [];
 const MAX_CACHED_EVENTS = 50;
 
 function addEvent(event: CachedEvent) {
@@ -369,6 +413,18 @@ function addEvent(event: CachedEvent) {
 
   io.emit(event.type, event.data);
   console.log(`[Chain ${event.chainId}] ${event.type}:`, event.data);
+}
+
+function addActivity(event: CachedEvent) {
+  if (recentActivities.some((e) => e.id === event.id)) return;
+
+  recentActivities.unshift(event);
+  if (recentActivities.length > MAX_CACHED_EVENTS) {
+    recentActivities.pop();
+  }
+
+  io.emit("activity", event.data);
+  console.log(`[Chain ${event.chainId}] activity(${event.data.activityType}):`, event.data);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,15 +442,19 @@ const watchers: ChainWatcher[] = [];
 
 const POLL_INTERVAL_MS = 30_000;
 
-const CONTRACT_ABI = [
+const SIR_CONTRACT_ABI = [
   EVENTS.AuctionStarted,
   EVENTS.BidReceived,
   EVENTS.AuctionedTokensSentToWinner,
   EVENTS.DividendsPaid,
+  EVENTS.Staked,
+  EVENTS.Unstaked,
+  EVENTS.DividendsClaimed,
+  EVENTS.RewardsClaimed,
 ] as const;
 
 /**
- * Process a log from the contract and emit it via Socket.IO.
+ * Process a log from the Sir contract and emit it via Socket.IO.
  */
 function processLog(
   chainId: number,
@@ -402,6 +462,7 @@ function processLog(
 ) {
   const id = `${chainId}-${log.transactionHash}-${log.logIndex}`;
   const blockNumber = log.blockNumber ? Number(log.blockNumber) : 0;
+  const logIndex = log.logIndex ?? 0;
 
   switch (log.eventName) {
     case "AuctionStarted":
@@ -416,6 +477,23 @@ function processLog(
           amount: log.args.amount?.toString(),
           txHash: log.transactionHash,
           blockNumber,
+        },
+      });
+      // Also emit as activity
+      addActivity({
+        id: `${id}-activity`,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "auctionStarted",
+          user: null,
+          token: log.args.token,
+          amount: log.args.amount?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
         },
       });
       break;
@@ -434,6 +512,22 @@ function processLog(
           blockNumber,
         },
       });
+      addActivity({
+        id: `${id}-activity`,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "bid",
+          user: log.args.bidder,
+          token: log.args.token,
+          amount: log.args.newBid?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
       break;
     case "AuctionedTokensSentToWinner":
       addEvent({
@@ -448,6 +542,22 @@ function processLog(
           amount: log.args.reward?.toString(),
           txHash: log.transactionHash,
           blockNumber,
+        },
+      });
+      addActivity({
+        id: `${id}-activity`,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "auctionSettled",
+          user: log.args.winner,
+          token: log.args.token,
+          amount: log.args.reward?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
         },
       });
       break;
@@ -466,13 +576,152 @@ function processLog(
         },
       });
       break;
+    case "Staked":
+      addActivity({
+        id,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "stake",
+          user: log.args.staker,
+          amount: log.args.amount?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
+      break;
+    case "Unstaked":
+      addActivity({
+        id,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "unstake",
+          user: log.args.staker,
+          amount: log.args.amount?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
+      break;
+    case "DividendsClaimed":
+      addActivity({
+        id,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "claimRewards",
+          user: log.args.staker,
+          amount: log.args.amount?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
+      break;
+    case "RewardsClaimed":
+      addActivity({
+        id,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "claimLpRewards",
+          user: log.args.contributor,
+          vaultId: log.args.vaultId?.toString(),
+          amount: log.args.rewards?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
+      break;
+  }
+}
+
+/**
+ * Process a log from the Vault contract and emit activity events.
+ */
+function processVaultLog(
+  chainId: number,
+  log: { transactionHash: string | null; logIndex: number | null; blockNumber: bigint | null; eventName: string | undefined; args: Record<string, unknown> }
+) {
+  const id = `${chainId}-${log.transactionHash}-${log.logIndex}`;
+  const blockNumber = log.blockNumber ? Number(log.blockNumber) : 0;
+  const logIndex = log.logIndex ?? 0;
+
+  switch (log.eventName) {
+    case "Mint":
+      addActivity({
+        id,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "mint",
+          user: log.args.minter,
+          vaultId: log.args.vaultId?.toString(),
+          amount: log.args.collateralIn?.toString(),
+          isAPE: log.args.isAPE,
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
+      break;
+    case "Burn":
+      addActivity({
+        id,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "burn",
+          user: log.args.burner,
+          vaultId: log.args.vaultId?.toString(),
+          amount: log.args.collateralWithdrawn?.toString(),
+          isAPE: log.args.isAPE,
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
+      break;
+    case "VaultInitialized":
+      addActivity({
+        id,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "vaultCreated",
+          vaultId: log.args.vaultId?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
+      break;
   }
 }
 
 function setupChainWatcher(
   chainId: number,
   rpcUrl: string,
-  contractAddress: Address
+  sirAddress: Address,
+  vaultAddress: Address | null
 ): ChainWatcher {
   const watcher: ChainWatcher = {
     chainId,
@@ -482,6 +731,15 @@ function setupChainWatcher(
   const client = createPublicClient({
     transport: http(rpcUrl, { batch: true }),
   });
+
+  // Build Vault ABI based on chain (legacy vs new Mint event)
+  const vaultAbi = vaultAddress
+    ? [
+        LEGACY_MINT_CHAIN_IDS.has(chainId) ? VAULT_EVENTS.MintLegacy : VAULT_EVENTS.MintNew,
+        VAULT_EVENTS.Burn,
+        VAULT_EVENTS.VaultInitialized,
+      ] as const
+    : null;
 
   let lastBlock = 0n;
 
@@ -493,7 +751,7 @@ function setupChainWatcher(
       if (lastBlock === 0n) {
         lastBlock = currentBlock;
         watcher.status = "watching";
-        console.log(`[Chain ${chainId}] Watching contract ${contractAddress} from block ${currentBlock}`);
+        console.log(`[Chain ${chainId}] Watching Sir=${sirAddress}${vaultAddress ? ` Vault=${vaultAddress}` : ""} from block ${currentBlock}`);
         return;
       }
 
@@ -501,19 +759,41 @@ function setupChainWatcher(
       if (currentBlock <= lastBlock) return;
 
       const fromBlock = lastBlock + 1n;
-      const logs = await client.getContractEvents({
-        address: contractAddress,
-        abi: CONTRACT_ABI,
-        fromBlock,
-        toBlock: currentBlock,
-      });
 
-      if (logs.length > 0) {
-        console.log(`[Chain ${chainId}] Found ${logs.length} event(s) in blocks ${fromBlock}-${currentBlock}`);
+      // Fetch Sir contract events and Vault contract events in parallel
+      const fetches: Promise<unknown[]>[] = [
+        client.getContractEvents({
+          address: sirAddress,
+          abi: SIR_CONTRACT_ABI,
+          fromBlock,
+          toBlock: currentBlock,
+        }),
+      ];
+
+      if (vaultAddress && vaultAbi) {
+        fetches.push(
+          client.getContractEvents({
+            address: vaultAddress,
+            abi: vaultAbi,
+            fromBlock,
+            toBlock: currentBlock,
+          })
+        );
       }
 
-      for (const log of logs) {
-        processLog(chainId, log as never);
+      const [sirLogs, vaultLogs] = await Promise.all(fetches);
+
+      const totalLogs = (sirLogs?.length ?? 0) + (vaultLogs?.length ?? 0);
+      if (totalLogs > 0) {
+        console.log(`[Chain ${chainId}] Found ${totalLogs} event(s) in blocks ${fromBlock}-${currentBlock}`);
+      }
+
+      for (const log of (sirLogs ?? []) as never[]) {
+        processLog(chainId, log);
+      }
+
+      for (const log of (vaultLogs ?? []) as never[]) {
+        processVaultLog(chainId, log);
       }
 
       lastBlock = currentBlock;
@@ -930,6 +1210,7 @@ io.on("connection", (socket) => {
 
   // Send recent events to newly connected client
   socket.emit("recentEvents", recentEvents.slice(0, 10));
+  socket.emit("recentActivities", recentActivities.slice(0, 10));
 
   // Handler for LP staking stats request - returns token amounts (not USD)
   socket.on("getLpStakingStats", ({ chainId }: { chainId: number }) => {
@@ -1015,10 +1296,14 @@ process.on("SIGTERM", () => void shutdown());
 async function main() {
   try {
     for (let i = 0; i < CHAIN_IDS.length; i++) {
+      const vaultAddr = VAULT_CONTRACT_ADDRESSES.length === CHAIN_IDS.length
+        ? VAULT_CONTRACT_ADDRESSES[i]
+        : null;
       const watcher = setupChainWatcher(
         CHAIN_IDS[i],
         RPC_URLS[i],
-        SIR_CONTRACT_ADDRESSES[i]
+        SIR_CONTRACT_ADDRESSES[i],
+        vaultAddr
       );
       watchers.push(watcher);
     }

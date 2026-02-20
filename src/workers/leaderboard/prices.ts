@@ -9,6 +9,7 @@ import {
 } from "viem";
 import { mainnet } from "viem/chains";
 import type { ChainConfig } from "../../lib/config.js";
+import { getCoingeckoConfig } from "../../lib/coingecko.js";
 
 // Uniswap V3 Pool ABI (minimal for price queries)
 const UniswapV3PoolABI = [
@@ -93,16 +94,16 @@ async function fetchCoinGeckoPrices(
 ): Promise<Record<string, number>> {
   if (tokens.length === 0 || !platform) return {};
 
+  const cg = await getCoingeckoConfig();
   const headers: HeadersInit = { accept: "application/json" };
-  const apiKey = process.env.COINGECKO_API_KEY;
-  if (apiKey) {
-    headers["x-cg-demo-api-key"] = apiKey;
+  if (cg.headerKey && cg.apiKey) {
+    headers[cg.headerKey] = cg.apiKey;
   }
 
   try {
     const addresses = tokens.map((t) => t.toLowerCase()).join(",");
     const response = await fetch(
-      `https://api.coingecko.com/api/v3/simple/token_price/${platform}?contract_addresses=${addresses}&vs_currencies=usd`,
+      `${cg.baseUrl}/simple/token_price/${platform}?contract_addresses=${addresses}&vs_currencies=usd`,
       { headers }
     );
 
@@ -133,15 +134,15 @@ async function fetchCoinGeckoPrices(
 async function fetchNativePrice(coinId: string): Promise<number> {
   if (!coinId) return 0;
 
+  const cg = await getCoingeckoConfig();
   const headers: HeadersInit = { accept: "application/json" };
-  const apiKey = process.env.COINGECKO_API_KEY;
-  if (apiKey) {
-    headers["x-cg-demo-api-key"] = apiKey;
+  if (cg.headerKey && cg.apiKey) {
+    headers[cg.headerKey] = cg.apiKey;
   }
 
   try {
     const response = await fetch(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`,
+      `${cg.baseUrl}/simple/price?ids=${coinId}&vs_currencies=usd`,
       { headers }
     );
 

@@ -575,6 +575,21 @@ function processLog(
           blockNumber,
         },
       });
+      addActivity({
+        id: `${id}-activity`,
+        type: "activity",
+        chainId,
+        timestamp: Date.now(),
+        data: {
+          chainId,
+          activityType: "dividendPaid",
+          user: null,
+          amount: log.args.amountETH?.toString(),
+          txHash: log.transactionHash,
+          blockNumber,
+          logIndex,
+        },
+      });
       break;
     case "Staked":
       addActivity({

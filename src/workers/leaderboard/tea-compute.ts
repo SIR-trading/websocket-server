@@ -92,10 +92,11 @@ export async function computeAndWriteTeaPositions(
   });
 
   // Build vault reserves map
-  const vaultReserves = new Map<number, { reserveLPers: bigint }>();
+  const vaultReserves = new Map<number, { reserveLPers: bigint; tickPriceX42: bigint }>();
   for (let i = 0; i < uniqueVaultIds.length; i++) {
     vaultReserves.set(uniqueVaultIds[i], {
       reserveLPers: reservesResult[i]?.reserveLPers ?? 0n,
+      tickPriceX42: reservesResult[i]?.tickPriceX42 ?? 0n,
     });
   }
 
@@ -157,6 +158,24 @@ export async function computeAndWriteTeaPositions(
     const pnlUsdPercentage =
       dollarTotal > 0 ? (pnlUsd / dollarTotal) * 100 : 0;
 
+    // Per-token PnL: collateral and debt
+    const debtDecimals = pos.vault.debtToken.decimals;
+    const initialCollateral = +formatUnits(BigInt(pos.collateralTotal), collateralDecimals);
+    const initialDebt = +formatUnits(BigInt(pos.debtTokenTotal), debtDecimals);
+
+    // Convert current collateral to debt equivalent via on-chain TWAP
+    // reserves is guaranteed to exist here since reserveLPers > 0n check passed above
+    const tickPriceX42 = reserves!.tickPriceX42;
+    const tickDecimal = Number(tickPriceX42) / (2 ** 42);
+    const rawPriceRatio = Math.pow(1.0001, tickDecimal);
+    const decimalAdjustment = Math.pow(10, collateralDecimals - debtDecimals);
+    const currentDebtEquivalent = currentCollateralAmount * rawPriceRatio * decimalAdjustment;
+
+    const pnlCollateral = currentCollateralAmount - initialCollateral;
+    const pnlDebt = currentDebtEquivalent - initialDebt;
+    const pnlPercentCollateral = initialCollateral > 0 ? (pnlCollateral / initialCollateral) * 100 : null;
+    const pnlPercentDebt = initialDebt > 0 ? (pnlDebt / initialDebt) * 100 : null;
+
     // SIR: claimed (from subgraph) + unclaimed (from on-chain)
     const claimedSir = +formatUnits(BigInt(pos.claimedSir), 12);
     const unclaimedSir = +formatUnits(unclaimedMap.get(pos.id) ?? 0n, 12);
@@ -174,6 +193,12 @@ export async function computeAndWriteTeaPositions(
       dollarTotal,
       pnlUsd,
       pnlUsdPercentage,
+      pnlCollateral,
+      pnlDebt,
+      pnlPercentCollateral,
+      pnlPercentDebt,
+      collateralDecimals,
+      debtDecimals,
       lockEnd: parseInt(pos.lockEnd, 10),
       totalSir,
       createdAt: parseInt(pos.createdAt, 10),

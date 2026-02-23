@@ -108,6 +108,12 @@ export interface ComputedTeaPositionData {
   dollarTotal: number;
   pnlUsd: number;
   pnlUsdPercentage: number;
+  pnlCollateral: number;
+  pnlDebt: number;
+  pnlPercentCollateral: number | null;
+  pnlPercentDebt: number | null;
+  collateralDecimals: number;
+  debtDecimals: number;
   lockEnd: number;
   totalSir: number;
   createdAt: number;

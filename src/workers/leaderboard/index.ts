@@ -9,17 +9,21 @@ import {
   fetchTeaPositionsBatch,
   fetchNewTeaPositions,
   fetchAllVaultTokens,
+  fetchAllApePositionIds,
+  fetchAllTeaPositionIds,
 } from "./subgraph.js";
 import { fetchPrices } from "./prices.js";
 import {
   computeAndWritePositions,
   filterPositions,
   removePositionFromRedis,
+  cleanupOrphanedApePositions,
 } from "./compute.js";
 import {
   computeAndWriteTeaPositions,
   filterTeaPositions,
   removeTeaPositionFromRedis,
+  cleanupOrphanedTeaPositions,
 } from "./tea-compute.js";
 import { cacheVaultMetricsForChain } from "./vault-metrics.js";
 import type { WorkerStatus } from "./types.js";
@@ -371,7 +375,7 @@ async function computeLeaderboardForChain(
     }
   }
 
-  // 3. Update cursor; if sweep complete, record timestamp
+  // 3. Update cursor; if sweep complete, record timestamp and clean orphans
   if (positions.length < MAX_POSITIONS_PER_RUN) {
     // Sweep complete - reset cursor and record timestamp
     await redis.del(`leaderboard:${chainId}:cursor`);
@@ -380,6 +384,13 @@ async function computeLeaderboardForChain(
       Math.floor(Date.now() / 1000).toString()
     );
     console.log(`[LeaderboardWorker] Chain ${chainId}: Full sweep complete`);
+
+    // Clean up orphaned positions (removed from subgraph via store.remove())
+    const subgraphIds = await fetchAllApePositionIds(client);
+    const orphansRemoved = await cleanupOrphanedApePositions(subgraphIds, chainId, redis);
+    if (orphansRemoved > 0) {
+      console.log(`[LeaderboardWorker] Chain ${chainId}: Removed ${orphansRemoved} orphaned APE positions`);
+    }
   } else {
     // More positions to process - save cursor
     await redis.set(
@@ -469,7 +480,7 @@ async function computeTeaLeaderboardForChain(
     }
   }
 
-  // 3. Update cursor; if sweep complete, record timestamp
+  // 3. Update cursor; if sweep complete, record timestamp and clean orphans
   if (positions.length < MAX_POSITIONS_PER_RUN) {
     await redis.del(`leaderboard:${chainId}:lp:cursor`);
     await redis.set(
@@ -479,6 +490,13 @@ async function computeTeaLeaderboardForChain(
     console.log(
       `[LeaderboardWorker] Chain ${chainId}: TEA full sweep complete`
     );
+
+    // Clean up orphaned TEA positions (removed from subgraph via store.remove())
+    const subgraphIds = await fetchAllTeaPositionIds(client);
+    const orphansRemoved = await cleanupOrphanedTeaPositions(subgraphIds, chainId, redis);
+    if (orphansRemoved > 0) {
+      console.log(`[LeaderboardWorker] Chain ${chainId}: Removed ${orphansRemoved} orphaned TEA positions`);
+    }
   } else {
     await redis.set(
       `leaderboard:${chainId}:lp:cursor`,

@@ -264,6 +264,24 @@ async function writeTeaPositionToRedis(
   await pipeline.exec();
 }
 
+export async function cleanupOrphanedTeaPositions(
+  subgraphIds: Set<string>,
+  chainId: number,
+  redis: RedisClientType
+): Promise<number> {
+  const redisKeys = await redis.hKeys(`leaderboard:${chainId}:lp:positions`);
+  let removed = 0;
+
+  for (const positionId of redisKeys) {
+    if (!subgraphIds.has(positionId)) {
+      await removeTeaPositionFromRedis(positionId, chainId, redis);
+      removed++;
+    }
+  }
+
+  return removed;
+}
+
 export async function removeTeaPositionFromRedis(
   positionId: string,
   chainId: number,

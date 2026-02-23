@@ -347,6 +347,24 @@ async function writePositionToRedis(
   }
 }
 
+export async function cleanupOrphanedApePositions(
+  subgraphIds: Set<string>,
+  chainId: number,
+  redis: RedisClientType
+): Promise<number> {
+  const redisKeys = await redis.hKeys(`leaderboard:${chainId}:positions`);
+  let removed = 0;
+
+  for (const positionId of redisKeys) {
+    if (!subgraphIds.has(positionId)) {
+      await removePositionFromRedis(positionId, chainId, redis);
+      removed++;
+    }
+  }
+
+  return removed;
+}
+
 /**
  * Remove a position from all Redis structures (for closed positions)
  */

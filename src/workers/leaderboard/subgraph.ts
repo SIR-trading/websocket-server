@@ -192,6 +192,80 @@ export async function fetchNewTeaPositions(
   return result.teaPositions;
 }
 
+// ID-only queries for orphan cleanup
+
+const ALL_APE_POSITION_IDS_QUERY = gql`
+  query AllApePositionIds($first: Int!, $lastId: String!) {
+    apePositions(
+      first: $first
+      orderBy: id
+      orderDirection: asc
+      where: { id_gt: $lastId }
+    ) {
+      id
+    }
+  }
+`;
+
+const ALL_TEA_POSITION_IDS_QUERY = gql`
+  query AllTeaPositionIds($first: Int!, $lastId: String!) {
+    teaPositions(
+      first: $first
+      orderBy: id
+      orderDirection: asc
+      where: { id_gt: $lastId }
+    ) {
+      id
+    }
+  }
+`;
+
+export async function fetchAllApePositionIds(
+  client: GraphQLClient
+): Promise<Set<string>> {
+  const ids = new Set<string>();
+  let cursor = "";
+  const pageSize = 1000;
+
+  while (true) {
+    const result = await client.request<{
+      apePositions: Array<{ id: string }>;
+    }>(ALL_APE_POSITION_IDS_QUERY, { first: pageSize, lastId: cursor });
+
+    for (const pos of result.apePositions) {
+      ids.add(pos.id);
+    }
+
+    if (result.apePositions.length < pageSize) break;
+    cursor = result.apePositions[result.apePositions.length - 1].id;
+  }
+
+  return ids;
+}
+
+export async function fetchAllTeaPositionIds(
+  client: GraphQLClient
+): Promise<Set<string>> {
+  const ids = new Set<string>();
+  let cursor = "";
+  const pageSize = 1000;
+
+  while (true) {
+    const result = await client.request<{
+      teaPositions: Array<{ id: string }>;
+    }>(ALL_TEA_POSITION_IDS_QUERY, { first: pageSize, lastId: cursor });
+
+    for (const pos of result.teaPositions) {
+      ids.add(pos.id);
+    }
+
+    if (result.teaPositions.length < pageSize) break;
+    cursor = result.teaPositions[result.teaPositions.length - 1].id;
+  }
+
+  return ids;
+}
+
 // Query all unique tokens across all vaults (for centralized price caching)
 const VAULT_TOKENS_QUERY = gql`
   query VaultTokens {

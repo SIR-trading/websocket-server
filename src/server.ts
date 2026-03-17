@@ -441,6 +441,7 @@ interface ChainWatcher {
 const watchers: ChainWatcher[] = [];
 
 const POLL_INTERVAL_MS = 30_000;
+const MAX_LOG_BLOCK_RANGE = 10_000n;
 
 const SIR_CONTRACT_ABI = [
   EVENTS.AuctionStarted,
@@ -732,6 +733,27 @@ function processVaultLog(
   }
 }
 
+async function getContractEventsChunked(
+  client: PublicClient,
+  params: { address: Address; abi: readonly unknown[]; fromBlock: bigint; toBlock: bigint }
+): Promise<unknown[]> {
+  const { fromBlock, toBlock, ...rest } = params;
+  if (toBlock - fromBlock + 1n <= MAX_LOG_BLOCK_RANGE) {
+    return client.getContractEvents({ ...rest, fromBlock, toBlock } as Parameters<typeof client.getContractEvents>[0]);
+  }
+  const allLogs: unknown[] = [];
+  let start = fromBlock;
+  while (start <= toBlock) {
+    const end = start + MAX_LOG_BLOCK_RANGE - 1n < toBlock
+      ? start + MAX_LOG_BLOCK_RANGE - 1n
+      : toBlock;
+    const logs = await client.getContractEvents({ ...rest, fromBlock: start, toBlock: end } as Parameters<typeof client.getContractEvents>[0]);
+    allLogs.push(...logs);
+    start = end + 1n;
+  }
+  return allLogs;
+}
+
 function setupChainWatcher(
   chainId: number,
   rpcUrl: string,
@@ -757,8 +779,11 @@ function setupChainWatcher(
     : null;
 
   let lastBlock = 0n;
+  let isPolling = false;
 
   async function poll() {
+    if (isPolling) return;
+    isPolling = true;
     try {
       const currentBlock = await client.getBlockNumber();
 
@@ -777,7 +802,7 @@ function setupChainWatcher(
 
       // Fetch Sir contract events and Vault contract events in parallel
       const fetches: Promise<unknown[]>[] = [
-        client.getContractEvents({
+        getContractEventsChunked(client, {
           address: sirAddress,
           abi: SIR_CONTRACT_ABI,
           fromBlock,
@@ -787,7 +812,7 @@ function setupChainWatcher(
 
       if (vaultAddress && vaultAbi) {
         fetches.push(
-          client.getContractEvents({
+          getContractEventsChunked(client, {
             address: vaultAddress,
             abi: vaultAbi,
             fromBlock,
@@ -823,6 +848,8 @@ function setupChainWatcher(
       console.error(`[Chain ${chainId}] Poll error:`, error);
       watcher.status = "error";
       watcher.error = String(error);
+    } finally {
+      isPolling = false;
     }
   }
 

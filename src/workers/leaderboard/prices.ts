@@ -344,7 +344,7 @@ export async function fetchPrices(
     if (wrappedNativeUsdPrice > 0) {
       const client = createPublicClient({
         chain: mainnet, // Chain doesn't affect RPC URL, just types
-        transport: http(config.rpcUrl),
+        transport: http(config.rpcUrl, { timeout: 30_000 }),
       });
 
       const dexPrices = await fetchDexPrices(

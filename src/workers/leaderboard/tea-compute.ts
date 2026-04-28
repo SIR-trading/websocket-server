@@ -71,7 +71,7 @@ export async function computeAndWriteTeaPositions(
 
   const client = createPublicClient({
     chain: mainnet,
-    transport: http(config.rpcUrl),
+    transport: http(config.rpcUrl, { timeout: 30_000 }),
   });
 
   // Build unique vault IDs for getReserves call

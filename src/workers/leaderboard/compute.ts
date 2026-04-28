@@ -74,7 +74,7 @@ export async function computeAndWritePositions(
 
   const client = createPublicClient({
     chain: mainnet,
-    transport: http(config.rpcUrl),
+    transport: http(config.rpcUrl, { timeout: 30_000 }),
   });
 
   // Build totalSupply multicall contracts
@@ -84,10 +84,14 @@ export async function computeAndWritePositions(
     functionName: "totalSupply" as const,
   }));
 
-  // Build vault IDs for getReserves call
-  const vaultIds = filtered.map((pos) =>
-    fromHex(pos.vault.id as `0x${string}`, "number")
-  );
+  // Build unique vault IDs for getReserves call
+  const uniqueVaultIds = [
+    ...new Set(
+      filtered.map((pos) =>
+        fromHex(pos.vault.id as `0x${string}`, "number")
+      )
+    ),
+  ];
 
   // Execute multicall and getReserves in parallel
   const [totalSupplyResults, reservesResult] = await Promise.all([
@@ -99,9 +103,17 @@ export async function computeAndWritePositions(
       address: config.assistantAddress as `0x${string}`,
       abi: ASSISTANT_GET_RESERVES_ABI,
       functionName: "getReserves",
-      args: [vaultIds],
+      args: [uniqueVaultIds],
     }),
   ]);
+
+  // Build vault reserves map keyed by vaultId
+  const vaultReserves = new Map<number, { reserveApes: bigint }>();
+  for (let i = 0; i < uniqueVaultIds.length; i++) {
+    vaultReserves.set(uniqueVaultIds[i], {
+      reserveApes: reservesResult[i]?.reserveApes ?? 0n,
+    });
+  }
 
   const baseFeeInBasisPoints = Math.round(config.baseFee * 10000);
   let processedCount = 0;
@@ -110,7 +122,8 @@ export async function computeAndWritePositions(
   for (let i = 0; i < filtered.length; i++) {
     const pos = filtered[i];
     const totalSupplyResult = totalSupplyResults[i];
-    const reserves = reservesResult[i];
+    const vaultId = fromHex(pos.vault.id as `0x${string}`, "number");
+    const reserves = vaultReserves.get(vaultId);
 
     const apeTotalSupply = BigInt(
       totalSupplyResult?.status === "success"

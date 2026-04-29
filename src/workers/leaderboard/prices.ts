@@ -159,152 +159,209 @@ async function fetchNativePrice(coinId: string): Promise<number> {
   }
 }
 
+// DEX-fallback chunking: keep each multicall small enough to survive flaky
+// RPCs (e.g. MegaETH) and let unrelated chunks succeed when one times out.
+const DEX_TOKENS_PER_CHUNK = 1; // 1 token × 4 fees × 3 fns = 12 sub-calls
+const DEX_MAX_CONCURRENCY = 3;
+
+interface DexProbeOutput {
+  /** USD price keyed by lowercased token address. */
+  prices: Record<string, number>;
+  /** Winning fee tier per token, lowercased. Only set when liquidity > 0. */
+  winningFeeTiers: Map<string, number>;
+}
+
+/**
+ * Probe a token at one or more fee tiers in a single multicall and pick the
+ * pool with highest liquidity. Returns null on RPC error or no positive-liquidity pool.
+ */
+async function probeTokenFeeTiers(
+  tokenAddress: string,
+  feeTiers: readonly number[],
+  decimals: Record<string, number>,
+  config: ChainConfig,
+  client: PublicClient,
+  chainId: number
+): Promise<{ priceInWrappedNative: number; fee: number } | null> {
+  const contracts: Array<{
+    address: `0x${string}`;
+    abi: typeof UniswapV3PoolABI;
+    functionName: "slot0" | "liquidity" | "token0";
+  }> = [];
+
+  for (const fee of feeTiers) {
+    const poolAddress = computePoolAddress(
+      tokenAddress,
+      config.wrappedNative,
+      fee,
+      config.v3Factory!,
+      config.v3PoolInitCodeHash!
+    ) as `0x${string}`;
+    for (const fn of ["slot0", "liquidity", "token0"] as const) {
+      contracts.push({ address: poolAddress, abi: UniswapV3PoolABI, functionName: fn });
+    }
+  }
+
+  let results;
+  try {
+    results = await client.multicall({ contracts, allowFailure: true });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    console.warn(
+      `[Prices] Chain ${chainId}: DEX probe failed for ${tokenAddress} (${feeTiers.length} tiers): ${msg}`
+    );
+    return null;
+  }
+
+  let bestLiquidity = 0n;
+  let bestPrice: number | null = null;
+  let winningFee: number | null = null;
+
+  for (let i = 0; i < feeTiers.length; i++) {
+    const slot0Result = results[i * 3];
+    const liquidityResult = results[i * 3 + 1];
+    const token0Result = results[i * 3 + 2];
+
+    if (
+      slot0Result?.status === "success" &&
+      liquidityResult?.status === "success" &&
+      token0Result?.status === "success"
+    ) {
+      const liquidity = liquidityResult.result as bigint;
+      if (liquidity > bestLiquidity) {
+        bestLiquidity = liquidity;
+        winningFee = feeTiers[i];
+        const slot0 = slot0Result.result as readonly [bigint, number, number, number, number, number, boolean];
+        const sqrtPriceX96 = slot0[0];
+        const token0 = (token0Result.result as string).toLowerCase();
+        const isToken0 = token0 === tokenAddress.toLowerCase();
+        const decimalsA =
+          decimals[tokenAddress.toLowerCase()] ?? decimals[tokenAddress] ?? 18;
+        const decimalsB = 18;
+        bestPrice = sqrtPriceX96ToPrice(
+          sqrtPriceX96,
+          isToken0 ? decimalsA : decimalsB,
+          isToken0 ? decimalsB : decimalsA,
+          isToken0
+        );
+      }
+    }
+  }
+
+  if (bestPrice === null || winningFee === null) return null;
+  return { priceInWrappedNative: bestPrice, fee: winningFee };
+}
+
+/**
+ * Price a single token. Tries the cached fee tier first (3 sub-calls); on miss,
+ * falls back to a full 4-tier probe (12 sub-calls).
+ */
+async function priceTokenChunk(
+  tokenAddress: string,
+  decimals: Record<string, number>,
+  config: ChainConfig,
+  client: PublicClient,
+  wrappedNativeUsdPrice: number,
+  chainId: number,
+  hint: number | undefined
+): Promise<{ priceUsd: number | null; winningFee: number | null }> {
+  // 1. Try the hinted fee tier (3 sub-calls).
+  if (hint !== undefined) {
+    const hinted = await probeTokenFeeTiers(
+      tokenAddress, [hint], decimals, config, client, chainId
+    );
+    if (hinted) {
+      return {
+        priceUsd: hinted.priceInWrappedNative * wrappedNativeUsdPrice,
+        winningFee: hinted.fee,
+      };
+    }
+    // Fall through: hinted pool gone or RPC error — re-probe all tiers.
+  }
+
+  // 2. Full 4-tier probe.
+  const full = await probeTokenFeeTiers(
+    tokenAddress, FEE_TIERS, decimals, config, client, chainId
+  );
+  if (!full) return { priceUsd: null, winningFee: null };
+  return {
+    priceUsd: full.priceInWrappedNative * wrappedNativeUsdPrice,
+    winningFee: full.fee,
+  };
+}
+
 /**
  * Fetch DEX prices for tokens not found on CoinGecko.
- * Gets token price in wrapped native, then converts to USD.
+ * Chunked + bounded-concurrency: a flaky RPC kills only its chunk, not the cycle.
+ * Uses per-token fee-tier hints (when provided) to skip exhaustive probing.
  */
 async function fetchDexPrices(
   tokens: string[],
   decimals: Record<string, number>,
   config: ChainConfig,
   client: PublicClient,
-  wrappedNativeUsdPrice: number
-): Promise<Record<string, number>> {
-  if (
-    tokens.length === 0 ||
-    !config.v3Factory ||
-    !config.v3PoolInitCodeHash
-  ) {
-    return {};
+  wrappedNativeUsdPrice: number,
+  chainId: number,
+  hints: Map<string, number>
+): Promise<DexProbeOutput> {
+  const out: DexProbeOutput = { prices: {}, winningFeeTiers: new Map() };
+  if (tokens.length === 0 || !config.v3Factory || !config.v3PoolInitCodeHash) {
+    return out;
   }
 
   const wrappedNative = config.wrappedNative.toLowerCase();
-  const priceMap: Record<string, number> = {};
-
-  // Build multicall contracts for all tokens × all fee tiers
-  const multicallContracts: Array<{
-    address: `0x${string}`;
-    abi: typeof UniswapV3PoolABI;
-    functionName: "slot0" | "liquidity" | "token0";
-  }> = [];
-
-  const contractMeta: Array<{
-    tokenAddress: string;
-    fee: number;
-    queryType: "slot0" | "liquidity" | "token0";
-  }> = [];
-
-  for (const tokenAddress of tokens) {
-    // Wrapped native token has 1:1 price with itself
-    if (tokenAddress.toLowerCase() === wrappedNative) {
-      priceMap[wrappedNative] = wrappedNativeUsdPrice;
-      continue;
-    }
-
-    for (const fee of FEE_TIERS) {
-      const poolAddress = computePoolAddress(
-        tokenAddress,
-        config.wrappedNative,
-        fee,
-        config.v3Factory!,
-        config.v3PoolInitCodeHash!
-      ) as `0x${string}`;
-
-      for (const fn of ["slot0", "liquidity", "token0"] as const) {
-        multicallContracts.push({
-          address: poolAddress,
-          abi: UniswapV3PoolABI,
-          functionName: fn,
-        });
-        contractMeta.push({ tokenAddress, fee, queryType: fn });
-      }
+  const dexTokens: string[] = [];
+  for (const t of tokens) {
+    if (t.toLowerCase() === wrappedNative) {
+      out.prices[wrappedNative] = wrappedNativeUsdPrice;
+    } else {
+      dexTokens.push(t);
     }
   }
 
-  if (multicallContracts.length === 0) return priceMap;
-
-  // Execute multicall
-  const results = await client.multicall({
-    contracts: multicallContracts,
-    allowFailure: true,
-  });
-
-  // Process results to find best price per token (highest liquidity pool)
-  for (const tokenAddress of tokens) {
-    if (tokenAddress.toLowerCase() === wrappedNative) continue;
-
-    let bestLiquidity = 0n;
-    let bestPrice: number | null = null;
-
-    for (const fee of FEE_TIERS) {
-      const slot0Index = contractMeta.findIndex(
-        (m) =>
-          m.tokenAddress === tokenAddress &&
-          m.fee === fee &&
-          m.queryType === "slot0"
-      );
-
-      if (slot0Index === -1) continue;
-
-      const slot0Result = results[slot0Index];
-      const liquidityResult = results[slot0Index + 1];
-      const token0Result = results[slot0Index + 2];
-
-      if (
-        slot0Result?.status === "success" &&
-        liquidityResult?.status === "success" &&
-        token0Result?.status === "success"
-      ) {
-        const liquidity = liquidityResult.result as bigint;
-
-        if (liquidity > bestLiquidity) {
-          bestLiquidity = liquidity;
-
-          const slot0 = slot0Result.result as readonly [
-            bigint,
-            number,
-            number,
-            number,
-            number,
-            number,
-            boolean,
-          ];
-          const sqrtPriceX96 = slot0[0];
-          const token0 = (token0Result.result as string).toLowerCase();
-
-          const isToken0 = token0 === tokenAddress.toLowerCase();
-          const decimalsA =
-            decimals[tokenAddress.toLowerCase()] ??
-            decimals[tokenAddress] ??
-            18;
-          const decimalsB = 18; // Wrapped native is always 18 decimals
-
-          bestPrice = sqrtPriceX96ToPrice(
-            sqrtPriceX96,
-            isToken0 ? decimalsA : decimalsB,
-            isToken0 ? decimalsB : decimalsA,
-            isToken0
-          );
-        }
-      }
-    }
-
-    if (bestPrice !== null && wrappedNativeUsdPrice > 0) {
-      priceMap[tokenAddress.toLowerCase()] = bestPrice * wrappedNativeUsdPrice;
+  for (let i = 0; i < dexTokens.length; i += DEX_MAX_CONCURRENCY) {
+    const wave = dexTokens.slice(i, i + DEX_MAX_CONCURRENCY);
+    const settled = await Promise.allSettled(
+      wave.map((token) =>
+        priceTokenChunk(
+          token,
+          decimals,
+          config,
+          client,
+          wrappedNativeUsdPrice,
+          chainId,
+          hints.get(token.toLowerCase())
+        ).then((r) => ({ token, ...r }))
+      )
+    );
+    for (const r of settled) {
+      if (r.status !== "fulfilled") continue;
+      const { token, priceUsd, winningFee } = r.value;
+      if (priceUsd !== null) out.prices[token.toLowerCase()] = priceUsd;
+      if (winningFee !== null) out.winningFeeTiers.set(token.toLowerCase(), winningFee);
     }
   }
 
-  return priceMap;
+  return out;
+}
+
+export interface FetchPricesResult {
+  prices: Record<string, number>;
+  /** Winning V3 fee tier per lowercased token address. Caller persists for next-cycle hints. */
+  winningFeeTiers: Map<string, number>;
 }
 
 /**
- * Fetch prices for tokens using CoinGecko (primary) + DEX (fallback)
+ * Fetch prices for tokens using CoinGecko (primary) + DEX (fallback).
+ * Optional `hints` map (lowercased token → fee tier) skips exhaustive 4-tier
+ * probing on the DEX path; on a hint miss the function falls back to a full probe.
  */
 export async function fetchPrices(
   config: ChainConfig,
-  tokens: Map<string, { decimals: number }>
-): Promise<Record<string, number>> {
-  if (tokens.size === 0) return {};
+  tokens: Map<string, { decimals: number }>,
+  hints: Map<string, number> = new Map()
+): Promise<FetchPricesResult> {
+  if (tokens.size === 0) return { prices: {}, winningFeeTiers: new Map() };
 
   const tokenAddresses = Array.from(tokens.keys());
   const decimalsMap: Record<string, number> = {};
@@ -313,6 +370,7 @@ export async function fetchPrices(
   });
 
   const priceMap: Record<string, number> = {};
+  const winningFeeTiers = new Map<string, number>();
   const wrappedNativeLower = config.wrappedNative.toLowerCase();
 
   // Step 1: Try CoinGecko first for all tokens
@@ -347,18 +405,21 @@ export async function fetchPrices(
         transport: http(config.rpcUrl, { timeout: 30_000 }),
       });
 
-      const dexPrices = await fetchDexPrices(
+      const dex = await fetchDexPrices(
         missingTokens,
         decimalsMap,
         config,
         client,
-        wrappedNativeUsdPrice
+        wrappedNativeUsdPrice,
+        config.chainId,
+        hints
       );
-      Object.assign(priceMap, dexPrices);
+      Object.assign(priceMap, dex.prices);
+      for (const [k, v] of dex.winningFeeTiers) winningFeeTiers.set(k, v);
     }
   }
 
-  return priceMap;
+  return { prices: priceMap, winningFeeTiers };
 }
 
 /**

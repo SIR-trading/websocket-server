@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(redis-cli *)",
+      "Bash(node -e ' *)",
+      "Bash(curl *)",
+      "Bash(node *)"
+    ]
+  }
+}

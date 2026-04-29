@@ -264,10 +264,13 @@ async function cachePricesForChain(
     return;
   }
 
-  // 4. Fetch prices (CoinGecko → DEX fallback)
-  const prices = await fetchPrices(config, tokens);
+  // 4. Read fee-tier hints (skips exhaustive 4-tier probe on the DEX fallback)
+  const hints = await readFeeTierHints(chainId, [...tokens.keys()], redis);
 
-  // 5. Guard: only write if we got at least some prices
+  // 5. Fetch prices (CoinGecko → DEX fallback)
+  const { prices, winningFeeTiers } = await fetchPrices(config, tokens, hints);
+
+  // 6. Guard: only write if we got at least some prices
   if (Object.keys(prices).length === 0) {
     console.warn(
       `[PriceCache] Chain ${chainId}: Got empty prices, keeping existing cache`
@@ -275,13 +278,63 @@ async function cachePricesForChain(
     return;
   }
 
-  // 6. Write to Redis (no TTL - stale reads are better than no reads)
+  // 7. Write prices to Redis (no TTL - stale reads are better than no reads)
   await redis.set(`prices:${chainId}`, JSON.stringify(prices));
   await redis.set(`prices:${chainId}:updatedAt`, Date.now().toString());
 
+  // 8. Refresh fee-tier hints for tokens that produced a winning pool this cycle
+  if (winningFeeTiers.size > 0) {
+    await writeFeeTierHints(chainId, winningFeeTiers, redis);
+  }
+
   console.log(
-    `[PriceCache] Chain ${chainId}: Cached ${Object.keys(prices).length} token prices`
+    `[PriceCache] Chain ${chainId}: Cached ${Object.keys(prices).length} token prices (${winningFeeTiers.size} hints refreshed)`
   );
+}
+
+const FEE_TIER_HINT_TTL_SECONDS = 86_400; // 24h — daily re-probe in case liquidity moves
+
+async function readFeeTierHints(
+  chainId: number,
+  tokens: string[],
+  redis: RedisClientType
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (tokens.length === 0) return out;
+  const keys = tokens.map((t) => `priceFeeTier:${chainId}:${t.toLowerCase()}`);
+  try {
+    const values = await redis.mGet(keys);
+    for (let i = 0; i < tokens.length; i++) {
+      const v = values[i];
+      if (v) {
+        const fee = parseInt(v, 10);
+        if (Number.isFinite(fee)) out.set(tokens[i].toLowerCase(), fee);
+      }
+    }
+  } catch (error) {
+    console.warn(`[PriceCache] Chain ${chainId}: hint read failed:`, error);
+  }
+  return out;
+}
+
+async function writeFeeTierHints(
+  chainId: number,
+  hints: Map<string, number>,
+  redis: RedisClientType
+): Promise<void> {
+  const pipeline = redis.multi();
+  for (const [token, fee] of hints) {
+    pipeline.set(
+      `priceFeeTier:${chainId}:${token.toLowerCase()}`,
+      String(fee),
+      { EX: FEE_TIER_HINT_TTL_SECONDS }
+    );
+  }
+  try {
+    await pipeline.exec();
+  } catch (error) {
+    console.warn(`[PriceCache] Chain ${chainId}: hint write failed:`, error);
+  }
 }
 
 /**

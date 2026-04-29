@@ -3,7 +3,6 @@ import {
   http,
   formatUnits,
   fromHex,
-  type PublicClient,
 } from "viem";
 import { mainnet } from "viem/chains";
 import type { RedisClientType } from "redis";
@@ -12,8 +11,14 @@ import type {
   CurrentApePositionFragment,
   ComputedPositionData,
 } from "./types.js";
+import type { PublicClient } from "viem";
+import { getReservesResilient } from "./reserves.js";
 
 const MIN_DOLLAR_TOTAL = 1; // Minimum $1 deposit to filter dust/test positions
+
+// Bound multicall size + concurrency so a flaky RPC kills only one chunk.
+const TOTAL_SUPPLY_CHUNK_SIZE = 50;
+const TOTAL_SUPPLY_MAX_CONCURRENCY = 3;
 
 // Minimal ABIs
 const ERC20_TOTAL_SUPPLY_ABI = [
@@ -26,25 +31,53 @@ const ERC20_TOTAL_SUPPLY_ABI = [
   },
 ] as const;
 
-const ASSISTANT_GET_RESERVES_ABI = [
-  {
-    type: "function",
-    name: "getReserves",
-    inputs: [{ name: "vaultIds", type: "uint48[]" }],
-    outputs: [
-      {
-        name: "reserves",
-        type: "tuple[]",
-        components: [
-          { name: "reserveApes", type: "uint144" },
-          { name: "reserveLPers", type: "uint144" },
-          { name: "tickPriceX42", type: "int64" },
-        ],
-      },
-    ],
-    stateMutability: "view",
-  },
-] as const;
+type TotalSupplyContract = {
+  address: `0x${string}`;
+  abi: typeof ERC20_TOTAL_SUPPLY_ABI;
+  functionName: "totalSupply";
+};
+
+type TotalSupplyResult =
+  | { status: "success"; result: bigint }
+  | { status: "failure"; error: Error };
+
+async function fetchTotalSuppliesResilient(
+  client: PublicClient,
+  contracts: TotalSupplyContract[],
+  chainId: number
+): Promise<TotalSupplyResult[]> {
+  const results: TotalSupplyResult[] = new Array(contracts.length);
+  const chunks: Array<{ start: number; end: number }> = [];
+  for (let i = 0; i < contracts.length; i += TOTAL_SUPPLY_CHUNK_SIZE) {
+    chunks.push({ start: i, end: Math.min(i + TOTAL_SUPPLY_CHUNK_SIZE, contracts.length) });
+  }
+
+  for (let i = 0; i < chunks.length; i += TOTAL_SUPPLY_MAX_CONCURRENCY) {
+    const wave = chunks.slice(i, i + TOTAL_SUPPLY_MAX_CONCURRENCY);
+    await Promise.all(
+      wave.map(async ({ start, end }) => {
+        const slice = contracts.slice(start, end);
+        try {
+          const out = await client.multicall({ contracts: slice, allowFailure: true });
+          for (let j = 0; j < out.length; j++) {
+            results[start + j] = out[j] as TotalSupplyResult;
+          }
+        } catch (error) {
+          const msg = error instanceof Error ? error.message.split("\n")[0] : String(error);
+          console.warn(
+            `[Compute] Chain ${chainId}: totalSupply chunk failed (${slice.length} positions): ${msg}`
+          );
+          const err = error instanceof Error ? error : new Error(String(error));
+          for (let j = 0; j < slice.length; j++) {
+            results[start + j] = { status: "failure", error: err };
+          }
+        }
+      })
+    );
+  }
+
+  return results;
+}
 
 /**
  * Filter positions: remove dust (<$1) and zero-balance (closed) positions
@@ -93,27 +126,16 @@ export async function computeAndWritePositions(
     ),
   ];
 
-  // Execute multicall and getReserves in parallel
-  const [totalSupplyResults, reservesResult] = await Promise.all([
-    client.multicall({
-      contracts: totalSupplyContracts,
-      allowFailure: true,
-    }),
-    client.readContract({
-      address: config.assistantAddress as `0x${string}`,
-      abi: ASSISTANT_GET_RESERVES_ABI,
-      functionName: "getReserves",
-      args: [uniqueVaultIds],
-    }),
+  // Run totalSupply (chunked + soft-fail) and getReserves (split-on-failure) in parallel
+  const [totalSupplyResults, vaultReserves] = await Promise.all([
+    fetchTotalSuppliesResilient(client, totalSupplyContracts, chainId),
+    getReservesResilient(
+      client,
+      config.assistantAddress as `0x${string}`,
+      uniqueVaultIds,
+      chainId
+    ),
   ]);
-
-  // Build vault reserves map keyed by vaultId
-  const vaultReserves = new Map<number, { reserveApes: bigint }>();
-  for (let i = 0; i < uniqueVaultIds.length; i++) {
-    vaultReserves.set(uniqueVaultIds[i], {
-      reserveApes: reservesResult[i]?.reserveApes ?? 0n,
-    });
-  }
 
   const baseFeeInBasisPoints = Math.round(config.baseFee * 10000);
   let processedCount = 0;

@@ -11,28 +11,9 @@ import type {
   CurrentTeaPositionFragment,
   ComputedTeaPositionData,
 } from "./types.js";
+import { getReservesResilient } from "./reserves.js";
 
 const MIN_DOLLAR_TOTAL = 1;
-
-const ASSISTANT_GET_RESERVES_ABI = [
-  {
-    type: "function",
-    name: "getReserves",
-    inputs: [{ name: "vaultIds", type: "uint48[]" }],
-    outputs: [
-      {
-        name: "reserves",
-        type: "tuple[]",
-        components: [
-          { name: "reserveApes", type: "uint144" },
-          { name: "reserveLPers", type: "uint144" },
-          { name: "tickPriceX42", type: "int64" },
-        ],
-      },
-    ],
-    stateMutability: "view",
-  },
-] as const;
 
 const VAULT_UNCLAIMED_REWARDS_ABI = [
   {
@@ -83,24 +64,16 @@ export async function computeAndWriteTeaPositions(
     ),
   ];
 
-  // Fetch reserves for all unique vaults
-  const reservesResult = await client.readContract({
-    address: config.assistantAddress as `0x${string}`,
-    abi: ASSISTANT_GET_RESERVES_ABI,
-    functionName: "getReserves",
-    args: [uniqueVaultIds],
-  });
+  // Fetch reserves with split-on-failure resilience
+  const vaultReserves = await getReservesResilient(
+    client,
+    config.assistantAddress as `0x${string}`,
+    uniqueVaultIds,
+    chainId
+  );
 
-  // Build vault reserves map
-  const vaultReserves = new Map<number, { reserveLPers: bigint; tickPriceX42: bigint }>();
-  for (let i = 0; i < uniqueVaultIds.length; i++) {
-    vaultReserves.set(uniqueVaultIds[i], {
-      reserveLPers: reservesResult[i]?.reserveLPers ?? 0n,
-      tickPriceX42: reservesResult[i]?.tickPriceX42 ?? 0n,
-    });
-  }
-
-  // Fetch unclaimedRewards in batches
+  // Fetch unclaimedRewards in batches; soft-fail per batch so a single
+  // RPC timeout doesn't abort the entire TEA cycle.
   const unclaimedMap = new Map<string, bigint>();
   for (let i = 0; i < filtered.length; i += UNCLAIMED_BATCH_SIZE) {
     const batch = filtered.slice(i, i + UNCLAIMED_BATCH_SIZE);
@@ -114,10 +87,17 @@ export async function computeAndWriteTeaPositions(
       ],
     }));
 
-    const results = await client.multicall({
-      contracts,
-      allowFailure: true,
-    });
+    let results;
+    try {
+      results = await client.multicall({ contracts, allowFailure: true });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message.split("\n")[0] : String(error);
+      console.warn(
+        `[TeaCompute] Chain ${chainId}: unclaimedRewards batch failed (${batch.length} positions): ${msg}`
+      );
+      for (const pos of batch) unclaimedMap.set(pos.id, 0n);
+      continue;
+    }
 
     for (let j = 0; j < batch.length; j++) {
       const result = results[j];

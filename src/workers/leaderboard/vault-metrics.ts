@@ -67,6 +67,7 @@ interface VaultMetrics {
   sirPerDay: number;
   volatilityAnnual: number | null;
   feesCount: number;
+  noExternalLps: boolean;
 }
 
 // Constants
@@ -95,9 +96,25 @@ function calculateSirRewardsApy(
   vault: VaultsForMetricsResult["vaults"][0],
   sirAddress: string | null,
   prices: Record<string, number>
-): number {
+): { apy: number; noExternalLps: boolean } {
+  // Detect the all-POL + active-emissions case using BigInt to avoid float rounding
+  // of large supply strings producing false positives.
+  const teaSupplyRaw = (() => {
+    try { return BigInt(vault.teaSupply || "0"); } catch { return 0n; }
+  })();
+  const lockedLiquidityRaw = (() => {
+    try { return BigInt(vault.lockedLiquidity || "0"); } catch { return 0n; }
+  })();
+  const rateRaw = (() => {
+    try { return BigInt(vault.rate || "0"); } catch { return 0n; }
+  })();
+  const noExternalLps =
+    teaSupplyRaw > 0n &&
+    lockedLiquidityRaw >= teaSupplyRaw &&
+    rateRaw > 0n;
+
   if (!vault.rate || parseFloat(vault.rate) === 0) {
-    return 0;
+    return { apy: 0, noExternalLps: false };
   }
 
   const ratePerSecond = parseFloat(vault.rate) / 1e12;
@@ -123,25 +140,32 @@ function calculateSirRewardsApy(
   }
 
   if (vaultCollateral === 0) {
-    return 0;
+    return { apy: 0, noExternalLps };
   }
 
   const collateralAddress = vault.collateralToken.id.toLowerCase();
 
   if (sirAddress && collateralAddress === sirAddress) {
-    return (annualSirRewards / vaultCollateral) * 100;
+    return {
+      apy: (annualSirRewards / vaultCollateral) * 100,
+      noExternalLps,
+    };
   }
 
   const sirPrice = sirAddress ? prices[sirAddress] : 0;
   const collateralPrice = prices[collateralAddress];
 
   if (!sirPrice || sirPrice <= 0 || !collateralPrice || collateralPrice <= 0) {
-    return 0;
+    return { apy: 0, noExternalLps };
   }
 
-  return (
-    ((annualSirRewards * sirPrice) / (vaultCollateral * collateralPrice)) * 100
-  );
+  return {
+    apy:
+      ((annualSirRewards * sirPrice) /
+        (vaultCollateral * collateralPrice)) *
+      100,
+    noExternalLps,
+  };
 }
 
 export async function cacheVaultMetricsForChain(
@@ -239,9 +263,11 @@ export async function cacheVaultMetricsForChain(
     const volatility = volatilityMap.get(vaultId);
 
     const vaultData = vaultDataMap.get(vaultId);
-    const sirRewardsApy = vaultData
+    const sirRewardsResult = vaultData
       ? calculateSirRewardsApy(vaultData, sirAddress, prices)
-      : 0;
+      : { apy: 0, noExternalLps: false };
+    const sirRewardsApy = sirRewardsResult.apy;
+    const noExternalLps = sirRewardsResult.noExternalLps;
 
     const sirPerDay =
       vaultData && vaultData.rate
@@ -257,6 +283,7 @@ export async function cacheVaultMetricsForChain(
       sirPerDay,
       volatilityAnnual: volatility ?? null,
       feesCount: 0,
+      noExternalLps,
     };
   }
 

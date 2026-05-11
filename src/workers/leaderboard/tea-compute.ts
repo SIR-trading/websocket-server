@@ -29,12 +29,17 @@ const VAULT_UNCLAIMED_REWARDS_ABI = [
 ] as const;
 
 export function filterTeaPositions(
-  positions: CurrentTeaPositionFragment[]
+  positions: CurrentTeaPositionFragment[],
+  vaultAddress: string
 ): CurrentTeaPositionFragment[] {
+  // POL is held by the vault contract itself; donated TEA must never appear
+  // as a user position on the leaderboard.
+  const vaultLower = vaultAddress.toLowerCase();
   return positions.filter(
     (p) =>
       parseFloat(p.dollarTotal) >= MIN_DOLLAR_TOTAL &&
-      BigInt(p.balance) > 0n
+      BigInt(p.balance) > 0n &&
+      p.user.toLowerCase() !== vaultLower
   );
 }
 
@@ -47,7 +52,7 @@ export async function computeAndWriteTeaPositions(
   redis: RedisClientType,
   prices: Record<string, number>
 ): Promise<number> {
-  const filtered = filterTeaPositions(positions);
+  const filtered = filterTeaPositions(positions, config.vaultAddress);
   if (filtered.length === 0) return 0;
 
   const client = createPublicClient({

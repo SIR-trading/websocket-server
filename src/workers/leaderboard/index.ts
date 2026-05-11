@@ -494,7 +494,18 @@ async function computeTeaLeaderboardForChain(
       console.log(
         `[LeaderboardWorker] Chain ${chainId}: Processing ${newPositions.length} new TEA positions`
       );
-      const filtered = filterTeaPositions(newPositions);
+      // Active-remove phantom TeaPositions owned by the vault itself (POL).
+      // The subgraph creates these on POL donations; the leaderboard must
+      // not surface them. See websocket-server fix paired with subgraph fix
+      // in tea.ts handleTeaTransfer.
+      const vaultLower = config.vaultAddress.toLowerCase();
+      const polPositions = newPositions.filter(
+        (p) => p.user.toLowerCase() === vaultLower
+      );
+      for (const pos of polPositions) {
+        await removeTeaPositionFromRedis(pos.id, chainId, redis);
+      }
+      const filtered = filterTeaPositions(newPositions, config.vaultAddress);
       if (filtered.length > 0) {
         const processed = await computeAndWriteTeaPositions(
           filtered,
@@ -519,7 +530,17 @@ async function computeTeaLeaderboardForChain(
   );
 
   if (positions.length > 0) {
-    const filtered = filterTeaPositions(positions);
+    // Active-remove vault-owned (POL) positions from Redis. Passive filtering
+    // alone would leave the stale row in the leaderboard cache.
+    const vaultLower = config.vaultAddress.toLowerCase();
+    const polPositions = positions.filter(
+      (p) => p.user.toLowerCase() === vaultLower
+    );
+    for (const pos of polPositions) {
+      await removeTeaPositionFromRedis(pos.id, chainId, redis);
+    }
+
+    const filtered = filterTeaPositions(positions, config.vaultAddress);
 
     // Remove closed positions (balance = 0)
     const closedPositions = positions.filter(

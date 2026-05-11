@@ -12,7 +12,7 @@ import {
   fetchAllApePositionIds,
   fetchAllTeaPositionIds,
 } from "./subgraph.js";
-import { fetchPrices } from "./prices.js";
+import { fetchPrices, FEE_TIERS, type PoolHint } from "./prices.js";
 import {
   computeAndWritePositions,
   filterPositions,
@@ -268,7 +268,7 @@ async function cachePricesForChain(
   const hints = await readFeeTierHints(chainId, [...tokens.keys()], redis);
 
   // 5. Fetch prices (CoinGecko → DEX fallback)
-  const { prices, winningFeeTiers } = await fetchPrices(config, tokens, hints);
+  const { prices, winningPools } = await fetchPrices(config, tokens, hints);
 
   // 6. Guard: only write if we got at least some prices
   if (Object.keys(prices).length === 0) {
@@ -282,34 +282,42 @@ async function cachePricesForChain(
   await redis.set(`prices:${chainId}`, JSON.stringify(prices));
   await redis.set(`prices:${chainId}:updatedAt`, Date.now().toString());
 
-  // 8. Refresh fee-tier hints for tokens that produced a winning pool this cycle
-  if (winningFeeTiers.size > 0) {
-    await writeFeeTierHints(chainId, winningFeeTiers, redis);
+  // 8. Refresh hints for tokens that produced a winning pool this cycle
+  if (winningPools.size > 0) {
+    await writeFeeTierHints(chainId, winningPools, redis);
   }
 
   console.log(
-    `[PriceCache] Chain ${chainId}: Cached ${Object.keys(prices).length} token prices (${winningFeeTiers.size} hints refreshed)`
+    `[PriceCache] Chain ${chainId}: Cached ${Object.keys(prices).length} token prices (${winningPools.size} hints refreshed)`
   );
 }
 
 const FEE_TIER_HINT_TTL_SECONDS = 86_400; // 24h — daily re-probe in case liquidity moves
 
+// Hint values are stored as "<lowercased-quote-address>:<feeTier>" (e.g.
+// "0xfafd...:3000"). Legacy bare-integer entries from the WETH-only era are
+// rejected by this regex and re-probed on the next cycle.
+const HINT_VALUE_PATTERN = /^(0x[0-9a-f]{40}):(\d+)$/;
+const FEE_TIER_SET: ReadonlySet<number> = new Set<number>(FEE_TIERS);
+
 async function readFeeTierHints(
   chainId: number,
   tokens: string[],
   redis: RedisClientType
-): Promise<Map<string, number>> {
-  const out = new Map<string, number>();
+): Promise<Map<string, PoolHint>> {
+  const out = new Map<string, PoolHint>();
   if (tokens.length === 0) return out;
   const keys = tokens.map((t) => `priceFeeTier:${chainId}:${t.toLowerCase()}`);
   try {
     const values = await redis.mGet(keys);
     for (let i = 0; i < tokens.length; i++) {
       const v = values[i];
-      if (v) {
-        const fee = parseInt(v, 10);
-        if (Number.isFinite(fee)) out.set(tokens[i].toLowerCase(), fee);
-      }
+      if (!v) continue;
+      const match = HINT_VALUE_PATTERN.exec(v);
+      if (!match) continue;
+      const fee = parseInt(match[2], 10);
+      if (!FEE_TIER_SET.has(fee)) continue;
+      out.set(tokens[i].toLowerCase(), { quote: match[1], fee });
     }
   } catch (error) {
     console.warn(`[PriceCache] Chain ${chainId}: hint read failed:`, error);
@@ -319,14 +327,14 @@ async function readFeeTierHints(
 
 async function writeFeeTierHints(
   chainId: number,
-  hints: Map<string, number>,
+  hints: Map<string, PoolHint>,
   redis: RedisClientType
 ): Promise<void> {
   const pipeline = redis.multi();
-  for (const [token, fee] of hints) {
+  for (const [token, hint] of hints) {
     pipeline.set(
       `priceFeeTier:${chainId}:${token.toLowerCase()}`,
-      String(fee),
+      `${hint.quote.toLowerCase()}:${hint.fee}`,
       { EX: FEE_TIER_HINT_TTL_SECONDS }
     );
   }

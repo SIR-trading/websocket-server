@@ -1,3 +1,12 @@
+export interface StablecoinAnchor {
+  /** Token address. Stored as configured; normalized to lowercase at use sites. */
+  address: string;
+  /** Seeded USD price used as a fallback when CoinGecko has no entry for this token. */
+  usdPrice: number;
+  /** ERC20 decimals. Wrong value silently scales every price quoted off this anchor. */
+  decimals: number;
+}
+
 export interface ChainConfig {
   chainId: number;
   rpcUrl: string;
@@ -13,6 +22,13 @@ export interface ChainConfig {
   v3Factory?: string;
   v3PoolInitCodeHash?: string;
   sirTokenAddress?: string; // SIR token address on this chain
+  /**
+   * Stablecoin tokens used as quote-side anchors in the DEX price fallback.
+   * Seeded into the price map when CoinGecko has no entry, and probed as quote
+   * tokens alongside wrapped native so tokens paired only against a stable
+   * (e.g. DIRTY/USDM on MegaETH) still get priced.
+   */
+  stablecoinAnchors?: StablecoinAnchor[];
 }
 
 // Chain-specific constants (from App's prices API)
@@ -25,6 +41,7 @@ const CHAIN_CONSTANTS: Record<
     v3PoolInitCodeHash?: string;
     coingeckoPlatform?: string;
     coingeckoNativeId?: string;
+    stablecoinAnchors?: StablecoinAnchor[];
   }
 > = {
   1: {
@@ -51,6 +68,15 @@ const CHAIN_CONSTANTS: Record<
     v3PoolInitCodeHash: "0x851d77a45b8b9a205fb9f44cb829cceba85282714d2603d601840640628a3da7",
     coingeckoPlatform: "megaeth",
     coingeckoNativeId: "ethereum",
+    stablecoinAnchors: [
+      {
+        // USDM (MegaUSD). CoinGecko has no listing on the `megaeth` platform,
+        // so without this seed every USDM-quoted vault renders "no price".
+        address: "0xfafddbb3fc7688494971a79cc65dca3ef82079e7",
+        usdPrice: 1,
+        decimals: 18,
+      },
+    ],
   },
   6343: {
     wrappedNative: "0x4200000000000000000000000000000000000006",

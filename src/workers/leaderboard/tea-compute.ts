@@ -234,6 +234,10 @@ async function writeTeaPositionToRedis(
     score: 0,
     value: positionId,
   });
+  pipeline.zAdd(`${prefix}:idx:lev:${computed.leverageTier}`, {
+    score: 0,
+    value: positionId,
+  });
   pipeline.zAdd(`${prefix}:idx:user:${computed.user.toLowerCase()}`, {
     score: 0,
     value: positionId,
@@ -287,6 +291,7 @@ export async function removeTeaPositionFromRedis(
   pipeline.zRem(`${prefix}:zset:sir`, positionId);
   pipeline.zRem(`${prefix}:zset:holding`, positionId);
   pipeline.zRem(`${prefix}:idx:pair:${pairKey}`, positionId);
+  pipeline.zRem(`${prefix}:idx:lev:${posData.leverageTier}`, positionId);
   pipeline.zRem(`${prefix}:idx:user:${posData.user.toLowerCase()}`, positionId);
   pipeline.hDel(`${prefix}:positions`, positionId);
 

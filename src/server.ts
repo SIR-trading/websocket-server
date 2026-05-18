@@ -17,6 +17,8 @@ import {
   getWorkerStatus,
 } from "./workers/leaderboard/index.js";
 import { closeRedisClient } from "./lib/redis.js";
+import { applyPgSchema, closePgPool } from "./lib/postgres.js";
+import referralsRouter from "./routes/referrals.js";
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -376,6 +378,8 @@ function getTokenAmountsFromLiquidity(
 const app = express();
 app.use(cors({ origin: FRONTEND_URLS }));
 app.use(express.json());
+
+app.use("/api/referrals", referralsRouter);
 
 const server = createServer(app);
 const io = new Server(server, {
@@ -1316,6 +1320,9 @@ async function shutdown() {
   // Close Redis connection
   await closeRedisClient();
 
+  // Close Postgres pool
+  await closePgPool();
+
   // Close Socket.IO
   void io.close(() => {
     console.log("[Socket.IO] Closed");
@@ -1337,6 +1344,16 @@ process.on("SIGTERM", () => void shutdown());
 
 async function main() {
   try {
+    // Apply Postgres schema (idempotent). Catch failures here so a Postgres
+    // outage at boot doesn't take down the WebSocket event feed and existing
+    // leaderboard — the referrals routes will return 503 until Postgres
+    // recovers (each route calls getPgPool() lazily on every request).
+    try {
+      await applyPgSchema();
+    } catch (err) {
+      console.error("[Postgres] Schema apply failed — referrals routes will return 503 until Postgres is reachable:", err);
+    }
+
     for (let i = 0; i < CHAIN_IDS.length; i++) {
       const vaultAddr = VAULT_CONTRACT_ADDRESSES.length === CHAIN_IDS.length
         ? VAULT_CONTRACT_ADDRESSES[i]

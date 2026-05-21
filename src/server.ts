@@ -16,8 +16,9 @@ import {
   startLeaderboardWorker,
   getWorkerStatus,
 } from "./workers/leaderboard/index.js";
+import { startReferralScoringWorker } from "./workers/referrals/index.js";
 import { closeRedisClient } from "./lib/redis.js";
-import { applyPgSchema, closePgPool } from "./lib/postgres.js";
+import { applyPgSchema, closePgPool, getPgPool } from "./lib/postgres.js";
 import referralsRouter from "./routes/referrals.js";
 
 // ---------------------------------------------------------------------------
@@ -1346,12 +1347,18 @@ async function main() {
   try {
     // Apply Postgres schema (idempotent). Catch failures here so a Postgres
     // outage at boot doesn't take down the WebSocket event feed and existing
-    // leaderboard — the referrals routes will return 503 until Postgres
+    // leaderboard. The referrals routes will return 503 until Postgres
     // recovers (each route calls getPgPool() lazily on every request).
+    // Track success so the Postgres-dependent referral scoring worker is
+    // skipped on boot when the DB isn't reachable (restart picks it up).
+    // applyPgSchema() is a no-op when DATABASE_URL is unset, so we also
+    // require a non-null pool before declaring readiness.
+    let pgSchemaReady = false;
     try {
       await applyPgSchema();
+      pgSchemaReady = getPgPool() !== null;
     } catch (err) {
-      console.error("[Postgres] Schema apply failed — referrals routes will return 503 until Postgres is reachable:", err);
+      console.error("[Postgres] Schema apply failed. Referrals routes will return 503 and the scoring worker will not start until Postgres is reachable:", err);
     }
 
     for (let i = 0; i < CHAIN_IDS.length; i++) {
@@ -1376,6 +1383,13 @@ async function main() {
 
       // Start leaderboard background worker
       startLeaderboardWorker();
+
+      // Start referral scoring worker (Postgres-dependent)
+      if (pgSchemaReady) {
+        startReferralScoringWorker();
+      } else {
+        console.log("[ReferralScoringWorker] Skipped: Postgres schema not ready");
+      }
 
       // Initialize LP staking (async, non-blocking)
       initializeLpStaking().catch((error) => {

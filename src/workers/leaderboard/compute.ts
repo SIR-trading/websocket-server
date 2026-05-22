@@ -16,6 +16,26 @@ import { getReservesResilient } from "./reserves.js";
 
 const MIN_DOLLAR_TOTAL = 1; // Minimum $1 deposit to filter dust/test positions
 
+// USD stablecoin symbols — must stay in sync with
+// App/src/lib/utils/stablecoin.ts. A pair counts as a "short" when collateral
+// is a stablecoin and debt is not; in that case the price displayed on the
+// leaderboard is collateral-per-debt (the debt asset priced in the stable),
+// which reads naturally as "the asset you shorted moved from X to Y".
+const USD_STABLECOINS: ReadonlySet<string> = new Set([
+  "USDC", "USDT", "DAI", "USDS", "USDE", "USD1", "PYUSD", "RLUSD",
+  "USDTB", "USDD", "GHO", "USD0", "FRAX", "FDUSD", "TUSD", "USDG",
+  "USDF", "PEPEUSD", "SUSDS",
+  "FEUSD", "USR", "USDH", "USDP", "USDXL", "USD₮0",
+  "USDM",
+]);
+
+function isShortPair(collateralSymbol: string | null | undefined, debtSymbol: string | null | undefined): boolean {
+  if (!collateralSymbol || !debtSymbol) return false;
+  const coll = collateralSymbol.trim().toUpperCase();
+  const debt = debtSymbol.trim().toUpperCase();
+  return USD_STABLECOINS.has(coll) && !USD_STABLECOINS.has(debt);
+}
+
 // Bound multicall size + concurrency so a flaky RPC kills only one chunk.
 const TOTAL_SUPPLY_CHUNK_SIZE = 50;
 const TOTAL_SUPPLY_MAX_CONCURRENCY = 3;
@@ -181,20 +201,48 @@ export async function computeAndWritePositions(
     const currentPositionValueUsd = currentCollateralAmount * collateralPriceUsd;
     const originalDepositValueUsd = parseFloat(pos.dollarTotal);
 
-    // Calculate entry price in USD from original deposit / original collateral amount
     const originalCollateralAmount = +formatUnits(
       BigInt(pos.collateralTotal),
       pos.vault.collateralToken.decimals
     );
-    const entryPriceUsd =
-      originalCollateralAmount > 0
-        ? originalDepositValueUsd / originalCollateralAmount
-        : 0;
+    const originalDebtAmount = +formatUnits(
+      BigInt(pos.debtTokenTotal),
+      pos.vault.debtToken.decimals
+    );
 
-    // Convert prices to quote terms (collateral per debt token)
-    // For stablecoin quotes (USDT, USDC), debtPriceUsd ≈ 1, so this is nearly the same as USD
-    const currentPrice = debtPriceUsd > 0 ? collateralPriceUsd / debtPriceUsd : 0;
-    const entryPrice = debtPriceUsd > 0 ? entryPriceUsd / debtPriceUsd : 0;
+    // Entry from on-chain mint snapshot; current from live prices. Same units
+    // on both sides so the arrow is meaningful. For longs we display
+    // debt-per-collateral (the collateral asset priced in the debt token). For
+    // shorts we invert and display collateral-per-debt (the shorted asset
+    // priced in the stablecoin collateral) — far more intuitive than "1 USDm
+    // = N RBT" when what users care about is RBT's USDm price.
+    //
+    // Both fields are gated on the SAME inputs (mint amounts present + both
+    // live USD prices present). If any input is missing we zero both so the
+    // PriceChange renderer dashes the cell instead of rendering "entry → 0".
+    // - debtTokenTotal can be 0n when the subgraph couldn't price the pair
+    //   at mint (no direct V3 pool).
+    // - debtPriceUsd / collateralPriceUsd can be 0 for tokens not indexed by
+    //   CoinGecko and not findable via the DEX fallback.
+    const isShort = isShortPair(
+      pos.vault.collateralToken.symbol,
+      pos.vault.debtToken.symbol
+    );
+    const canPrice =
+      originalCollateralAmount > 0 &&
+      originalDebtAmount > 0 &&
+      collateralPriceUsd > 0 &&
+      debtPriceUsd > 0;
+    const entryPrice = !canPrice
+      ? 0
+      : isShort
+        ? originalCollateralAmount / originalDebtAmount
+        : originalDebtAmount / originalCollateralAmount;
+    const currentPrice = !canPrice
+      ? 0
+      : isShort
+        ? debtPriceUsd / collateralPriceUsd
+        : collateralPriceUsd / debtPriceUsd;
 
     const pnlUsd = currentPositionValueUsd - originalDepositValueUsd;
     const pnlUsdPercentage =

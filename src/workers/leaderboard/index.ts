@@ -268,12 +268,19 @@ async function cachePricesForChain(
   const hints = await readFeeTierHints(chainId, [...tokens.keys()], redis);
 
   // 5. Fetch prices (CoinGecko → DEX fallback)
-  const { prices, winningPools } = await fetchPrices(config, tokens, hints);
+  const { prices, winningPools, derivedCount } = await fetchPrices(
+    config,
+    tokens,
+    hints
+  );
 
-  // 6. Guard: only write if we got at least some prices
-  if (Object.keys(prices).length === 0) {
+  // 6. Guard: only write if at least one price came from a real source
+  // (CoinGecko, native fallback, or DEX). Anchor seeds alone don't count —
+  // they would otherwise overwrite a previously-fresh cache with $1 stubs
+  // during a combined CG + bootstrap outage.
+  if (derivedCount === 0) {
     console.warn(
-      `[PriceCache] Chain ${chainId}: Got empty prices, keeping existing cache`
+      `[PriceCache] Chain ${chainId}: No derived prices this cycle, keeping existing cache`
     );
     return;
   }

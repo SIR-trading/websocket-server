@@ -52,6 +52,21 @@ const CHAIN_CONSTANTS: Record<
       "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54",
     coingeckoPlatform: "ethereum",
     coingeckoNativeId: "ethereum",
+    // Quote-side anchors used by the DEX fallback when CoinGecko is
+    // unavailable. Without these, a CG outage drops the entire cache for
+    // chain 1 because Step 4 has no priced quote token to probe against.
+    stablecoinAnchors: [
+      {
+        address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", // USDT
+        usdPrice: 1,
+        decimals: 6,
+      },
+      {
+        address: "0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48", // USDC
+        usdPrice: 1,
+        decimals: 6,
+      },
+    ],
   },
   999: {
     wrappedNative: "0x5555555555555555555555555555555555555555",
@@ -61,6 +76,14 @@ const CHAIN_CONSTANTS: Record<
       "0xe3572921be1688dba92df30c6781b8770499ff274d20ae9b325f4242634774fb",
     coingeckoPlatform: "hyperevm",
     coingeckoNativeId: "hyperliquid", // HYPE token
+    stablecoinAnchors: [
+      {
+        // USD₮0 — LayerZero OFT-bridged USDT on HyperEVM, 6 decimals.
+        address: "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb",
+        usdPrice: 1,
+        decimals: 6,
+      },
+    ],
   }, 4326: {
     wrappedNative: "0x4200000000000000000000000000000000000006",
     wrappedNativeSymbol: "WETH",

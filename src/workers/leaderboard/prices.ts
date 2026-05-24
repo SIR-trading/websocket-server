@@ -390,6 +390,13 @@ export interface FetchPricesResult {
   prices: Record<string, number>;
   /** Winning (quote, fee) per lowercased token address. Caller persists for next-cycle hints. */
   winningPools: Map<string, PoolHint>;
+  /**
+   * Count of prices obtained from real sources (CoinGecko, native fallback,
+   * DEX probes). Excludes anchor seeds — a map containing *only* anchor
+   * stubs has `derivedCount === 0` and the caller must treat that as empty,
+   * to avoid overwriting a previously-fresh cache with $1 placeholders.
+   */
+  derivedCount: number;
 }
 
 /**
@@ -403,7 +410,8 @@ export async function fetchPrices(
   tokens: Map<string, { decimals: number }>,
   hints: Map<string, PoolHint> = new Map()
 ): Promise<FetchPricesResult> {
-  if (tokens.size === 0) return { prices: {}, winningPools: new Map() };
+  if (tokens.size === 0)
+    return { prices: {}, winningPools: new Map(), derivedCount: 0 };
 
   const tokenAddresses = Array.from(tokens.keys());
   const decimalsMap: Record<string, number> = {};
@@ -414,6 +422,7 @@ export async function fetchPrices(
   const priceMap: Record<string, number> = {};
   const winningPools = new Map<string, PoolHint>();
   const wrappedNativeLower = config.wrappedNative.toLowerCase();
+  let derivedCount = 0;
 
   // Step 1: Try CoinGecko first for all tokens
   if (config.coingeckoPlatform) {
@@ -422,6 +431,7 @@ export async function fetchPrices(
       config.coingeckoPlatform
     );
     Object.assign(priceMap, cgPrices);
+    derivedCount += Object.keys(cgPrices).length;
   }
 
   // Step 2: Ensure wrapped native has a price (use coin ID if contract lookup failed)
@@ -429,12 +439,15 @@ export async function fetchPrices(
     const nativePrice = await fetchNativePrice(config.coingeckoNativeId);
     if (nativePrice > 0) {
       priceMap[wrappedNativeLower] = nativePrice;
+      derivedCount += 1;
     }
   }
 
   // Step 3: Seed stablecoin anchors as a fallback for tokens CoinGecko didn't
   // price. CoinGecko wins when present so a real depeg is respected instead of
-  // being overridden by the hardcoded $1 assumption.
+  // being overridden by the hardcoded $1 assumption. Anchor seeds intentionally
+  // do NOT bump `derivedCount` — they are stubs, not real prices, and we don't
+  // want an anchor-only result to overwrite a previously-fresh Redis cache.
   const anchorQuotes: QuoteToken[] = [];
   if (config.stablecoinAnchors) {
     for (const anchor of config.stablecoinAnchors) {
@@ -453,6 +466,51 @@ export async function fetchPrices(
     }
   }
 
+  // Build a single DEX client reused by Step 3.5 and Step 4 (lazy: not all
+  // chains have a V3 factory configured, e.g. some testnets).
+  const dexClient =
+    config.v3Factory && config.v3PoolInitCodeHash
+      ? createPublicClient({
+          chain: mainnet, // Chain doesn't affect RPC URL, just types
+          transport: http(config.rpcUrl, { timeout: 30_000 }),
+        })
+      : null;
+
+  // Step 3.5: Bootstrap wrapped-native USD price via a WETH/anchor DEX pool
+  // when CoinGecko didn't supply one. Without this, Step 4 below builds
+  // `quoteTokens` from anchors only — so any token with liquidity solely
+  // against WETH (e.g. SIR/WETH on MegaETH) silently drops out of the cache
+  // during a CG outage, even though its pool is fine on-chain.
+  if (
+    priceMap[wrappedNativeLower] === undefined &&
+    anchorQuotes.length > 0 &&
+    dexClient
+  ) {
+    const wethProbe = await fetchDexPrices(
+      [wrappedNativeLower],
+      { [wrappedNativeLower]: 18 },
+      anchorQuotes,
+      config,
+      dexClient,
+      config.chainId,
+      hints
+    );
+    const wethPrice = wethProbe.prices[wrappedNativeLower];
+    const winningPool = wethProbe.winningPools.get(wrappedNativeLower);
+    if (wethPrice !== undefined && wethPrice > 0) {
+      priceMap[wrappedNativeLower] = wethPrice;
+      derivedCount += 1;
+      if (winningPool) winningPools.set(wrappedNativeLower, winningPool);
+      console.log(
+        `[Prices] Chain ${config.chainId}: Bootstrapped ${config.wrappedNativeSymbol} @ $${wethPrice.toPrecision(6)} via anchor ${winningPool?.quote} (fee ${winningPool?.fee})`
+      );
+    } else {
+      console.warn(
+        `[Prices] Chain ${config.chainId}: ${config.wrappedNativeSymbol} bootstrap failed against ${anchorQuotes.length} anchor(s); tokens priced only against ${config.wrappedNativeSymbol} will be skipped this cycle`
+      );
+    }
+  }
+
   // Find tokens still missing prices
   const missingTokens = tokenAddresses.filter(
     (t) => priceMap[t.toLowerCase()] === undefined
@@ -461,7 +519,7 @@ export async function fetchPrices(
   // Step 4: Fallback to DEX for missing tokens. Quote tokens = wrapped native
   // (when priced) + every anchor with a positive USD price. The DEX path runs
   // whenever at least one quote is usable, not just when WETH is priced.
-  if (missingTokens.length > 0 && config.v3Factory) {
+  if (missingTokens.length > 0 && dexClient) {
     const wrappedNativeUsdPrice = priceMap[wrappedNativeLower] ?? 0;
     const quoteTokens: QuoteToken[] = [];
     if (wrappedNativeUsdPrice > 0) {
@@ -474,26 +532,22 @@ export async function fetchPrices(
     quoteTokens.push(...anchorQuotes);
 
     if (quoteTokens.length > 0) {
-      const client = createPublicClient({
-        chain: mainnet, // Chain doesn't affect RPC URL, just types
-        transport: http(config.rpcUrl, { timeout: 30_000 }),
-      });
-
       const dex = await fetchDexPrices(
         missingTokens,
         decimalsMap,
         quoteTokens,
         config,
-        client,
+        dexClient,
         config.chainId,
         hints
       );
       Object.assign(priceMap, dex.prices);
+      derivedCount += Object.keys(dex.prices).length;
       for (const [k, v] of dex.winningPools) winningPools.set(k, v);
     }
   }
 
-  return { prices: priceMap, winningPools };
+  return { prices: priceMap, winningPools, derivedCount };
 }
 
 /**

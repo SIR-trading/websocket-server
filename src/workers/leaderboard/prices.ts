@@ -10,6 +10,24 @@ import {
 import { mainnet } from "viem/chains";
 import type { ChainConfig } from "../../lib/config.js";
 import { getCoingeckoConfig } from "../../lib/coingecko.js";
+import type { VaultPair } from "./subgraph.js";
+
+// Source ranks for cross-pair partner selection (lower = higher confidence).
+// Used by Step 5 to prefer CoinGecko/native/anchor partners over same-cycle
+// DEX-derived ones when multiplying through a partner USD price.
+const RANK_COINGECKO = 0;
+const RANK_NATIVE = 0;
+const RANK_ANCHOR_STUB = 1;
+const RANK_DEX_PROBE = 2;
+
+function isUsablePairAddress(addr: string): boolean {
+  try {
+    getAddress(addr);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Uniswap V3 Pool ABI (minimal for price queries)
 const UniswapV3PoolABI = [
@@ -408,7 +426,8 @@ export interface FetchPricesResult {
 export async function fetchPrices(
   config: ChainConfig,
   tokens: Map<string, { decimals: number }>,
-  hints: Map<string, PoolHint> = new Map()
+  hints: Map<string, PoolHint> = new Map(),
+  pairs: VaultPair[] = []
 ): Promise<FetchPricesResult> {
   if (tokens.size === 0)
     return { prices: {}, winningPools: new Map(), derivedCount: 0 };
@@ -421,6 +440,10 @@ export async function fetchPrices(
 
   const priceMap: Record<string, number> = {};
   const winningPools = new Map<string, PoolHint>();
+  // Tracks where each price came from. Step 5 reads this to prefer
+  // high-confidence partners (CoinGecko/native/anchor) over same-cycle
+  // DEX-derived ones when multiplying through a partner USD price.
+  const sourceRank = new Map<string, number>();
   const wrappedNativeLower = config.wrappedNative.toLowerCase();
   let derivedCount = 0;
 
@@ -431,6 +454,7 @@ export async function fetchPrices(
       config.coingeckoPlatform
     );
     Object.assign(priceMap, cgPrices);
+    for (const addr of Object.keys(cgPrices)) sourceRank.set(addr, RANK_COINGECKO);
     derivedCount += Object.keys(cgPrices).length;
   }
 
@@ -439,6 +463,7 @@ export async function fetchPrices(
     const nativePrice = await fetchNativePrice(config.coingeckoNativeId);
     if (nativePrice > 0) {
       priceMap[wrappedNativeLower] = nativePrice;
+      sourceRank.set(wrappedNativeLower, RANK_NATIVE);
       derivedCount += 1;
     }
   }
@@ -454,6 +479,7 @@ export async function fetchPrices(
       const addrLower = anchor.address.toLowerCase();
       if (priceMap[addrLower] === undefined && anchor.usdPrice > 0) {
         priceMap[addrLower] = anchor.usdPrice;
+        sourceRank.set(addrLower, RANK_ANCHOR_STUB);
       }
       const usdPrice = priceMap[addrLower] ?? 0;
       if (usdPrice > 0) {
@@ -499,6 +525,7 @@ export async function fetchPrices(
     const winningPool = wethProbe.winningPools.get(wrappedNativeLower);
     if (wethPrice !== undefined && wethPrice > 0) {
       priceMap[wrappedNativeLower] = wethPrice;
+      sourceRank.set(wrappedNativeLower, RANK_DEX_PROBE);
       derivedCount += 1;
       if (winningPool) winningPools.set(wrappedNativeLower, winningPool);
       console.log(
@@ -542,8 +569,88 @@ export async function fetchPrices(
         hints
       );
       Object.assign(priceMap, dex.prices);
+      for (const addr of Object.keys(dex.prices)) sourceRank.set(addr, RANK_DEX_PROBE);
       derivedCount += Object.keys(dex.prices).length;
       for (const [k, v] of dex.winningPools) winningPools.set(k, v);
+    }
+  }
+
+  // Step 5: Cross-pair fallback. For tokens still missing after CoinGecko + anchor
+  // DEX, probe V3 pools against SIR-pair partners that ARE already priced. The
+  // pool exists on-chain (SIR created the vault) and gives us priceInPartner;
+  // multiply by partner USD to get the missing token's USD price.
+  //
+  // Single pass: only prices known BEFORE Step 5 are usable as synthetic quotes
+  // (snapshotted in `pricedBefore`). This prevents same-cycle chains where one
+  // derived price would unlock another, compounding error through thin pools.
+  const pricedBefore = new Set(Object.keys(priceMap));
+  const stillMissing = tokenAddresses
+    .map((t) => t.toLowerCase())
+    .filter((t) => !pricedBefore.has(t));
+
+  if (stillMissing.length > 0 && dexClient && pairs.length > 0) {
+    // Build adjacency: token -> Set<partner>. Self-pairs and malformed
+    // addresses are filtered here so Step 5's contract-list build never throws
+    // out of probeTokenFeeTiers' try/catch (computePoolAddress calls getAddress
+    // before the multicall).
+    const adjacency = new Map<string, Set<string>>();
+    for (const { collateralId, debtId } of pairs) {
+      if (collateralId === debtId) continue;
+      if (!isUsablePairAddress(collateralId) || !isUsablePairAddress(debtId)) continue;
+      if (!adjacency.has(collateralId)) adjacency.set(collateralId, new Set());
+      if (!adjacency.has(debtId)) adjacency.set(debtId, new Set());
+      adjacency.get(collateralId)!.add(debtId);
+      adjacency.get(debtId)!.add(collateralId);
+    }
+
+    const MAX_PARTNERS_PER_TOKEN = 3;
+    const rank = (addr: string): number => sourceRank.get(addr) ?? 99;
+
+    const probes = stillMissing
+      .map((token) => {
+        const partners = [...(adjacency.get(token) ?? [])]
+          .filter((p) => pricedBefore.has(p) && tokens.has(p))
+          .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+          .slice(0, MAX_PARTNERS_PER_TOKEN)
+          .map<QuoteToken>((p) => ({
+            address: p,
+            usdPrice: priceMap[p],
+            decimals: tokens.get(p)!.decimals,
+          }));
+        return partners.length > 0 ? { token, partners } : null;
+      })
+      .filter((x): x is { token: string; partners: QuoteToken[] } => x !== null);
+
+    for (let i = 0; i < probes.length; i += DEX_MAX_CONCURRENCY) {
+      const wave = probes.slice(i, i + DEX_MAX_CONCURRENCY);
+      const settled = await Promise.allSettled(
+        wave.map(({ token, partners }) =>
+          priceTokenChunk(
+            token,
+            tokens.get(token)?.decimals ?? 18,
+            partners,
+            config,
+            dexClient,
+            config.chainId,
+            hints.get(token)
+          ).then((r) => ({ token, ...r }))
+        )
+      );
+      for (const r of settled) {
+        if (r.status !== "fulfilled") continue;
+        const { token, priceUsd, winningPool } = r.value;
+        if (priceUsd !== null) {
+          priceMap[token] = priceUsd;
+          sourceRank.set(token, RANK_DEX_PROBE);
+          derivedCount += 1;
+          if (winningPool) {
+            console.log(
+              `[Prices] Chain ${config.chainId}: Derived ${token} @ $${priceUsd.toPrecision(6)} via partner ${winningPool.quote} (fee ${winningPool.fee})`
+            );
+          }
+        }
+        if (winningPool !== null) winningPools.set(token, winningPool);
+      }
     }
   }
 

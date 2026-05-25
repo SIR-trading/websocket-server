@@ -309,3 +309,39 @@ export async function fetchAllVaultIds(
   }>(VAULT_IDS_QUERY);
   return result.vaults.map((v) => parseInt(v.id, 16));
 }
+
+// Query (collateralToken, debtToken) pairs for every vault. Feeds the cross-pair
+// price fallback: when an exotic token has no anchor pool but a SIR vault pairs
+// it with a token that IS priced, we probe that pair's V3 pool to derive USD.
+const VAULT_PAIRS_QUERY = gql`
+  query VaultPairs {
+    vaults(first: 1000, orderBy: id, orderDirection: asc) {
+      collateralToken {
+        id
+      }
+      debtToken {
+        id
+      }
+    }
+  }
+`;
+
+export interface VaultPair {
+  collateralId: string;
+  debtId: string;
+}
+
+export async function fetchAllVaultPairs(
+  client: GraphQLClient
+): Promise<VaultPair[]> {
+  const result = await client.request<{
+    vaults: Array<{
+      collateralToken: { id: string };
+      debtToken: { id: string };
+    }>;
+  }>(VAULT_PAIRS_QUERY);
+  return result.vaults.map((v) => ({
+    collateralId: v.collateralToken.id.toLowerCase(),
+    debtId: v.debtToken.id.toLowerCase(),
+  }));
+}

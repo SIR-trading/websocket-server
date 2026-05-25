@@ -9,6 +9,7 @@ import {
   fetchTeaPositionsBatch,
   fetchNewTeaPositions,
   fetchAllVaultTokens,
+  fetchAllVaultPairs,
   fetchAllApePositionIds,
   fetchAllTeaPositionIds,
 } from "./subgraph.js";
@@ -237,8 +238,12 @@ async function cachePricesForChain(
   const chainId = config.chainId;
   const client = createSubgraphClient(config.subgraphUrl, config.subgraphApiKey);
 
-  // 1. Fetch all unique vault tokens from the subgraph
-  const vaultTokens = await fetchAllVaultTokens(client);
+  // 1. Fetch all unique vault tokens + the (collateral, debt) pairs from the
+  // subgraph. Pairs feed the Step-5 cross-pair fallback in fetchPrices.
+  const [vaultTokens, vaultPairs] = await Promise.all([
+    fetchAllVaultTokens(client),
+    fetchAllVaultPairs(client),
+  ]);
   const tokens = new Map<string, { decimals: number }>();
 
   for (const token of vaultTokens) {
@@ -267,11 +272,12 @@ async function cachePricesForChain(
   // 4. Read fee-tier hints (skips exhaustive 4-tier probe on the DEX fallback)
   const hints = await readFeeTierHints(chainId, [...tokens.keys()], redis);
 
-  // 5. Fetch prices (CoinGecko → DEX fallback)
+  // 5. Fetch prices (CoinGecko → anchor DEX → cross-pair DEX)
   const { prices, winningPools, derivedCount } = await fetchPrices(
     config,
     tokens,
-    hints
+    hints,
+    vaultPairs
   );
 
   // 6. Guard: only write if at least one price came from a real source

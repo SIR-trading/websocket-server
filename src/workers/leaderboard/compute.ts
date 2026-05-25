@@ -16,11 +16,15 @@ import { getReservesResilient } from "./reserves.js";
 
 const MIN_DOLLAR_TOTAL = 1; // Minimum $1 deposit to filter dust/test positions
 
-// USD stablecoin symbols — must stay in sync with
-// App/src/lib/utils/stablecoin.ts. A pair counts as a "short" when collateral
-// is a stablecoin and debt is not; in that case the price displayed on the
-// leaderboard is collateral-per-debt (the debt asset priced in the stable),
-// which reads naturally as "the asset you shorted moved from X to Y".
+// Three-tier anchor hierarchy — must stay in sync with
+// App/src/lib/utils/stablecoin.ts. A pair counts as a "short" when the
+// collateral is a stronger anchor than the debt:
+//   Tier 1 (strongest): USD stablecoins (any chain)
+//   Tier 2:             WETH (any chain)
+//   Tier 3:             CL8Y-cb on MegaETH only
+// On short rows we display collateral-per-debt (the debt asset priced in the
+// collateral), which reads naturally as "the asset you shorted moved from X
+// to Y".
 const USD_STABLECOINS: ReadonlySet<string> = new Set([
   "USDC", "USDT", "DAI", "USDS", "USDE", "USD1", "PYUSD", "RLUSD",
   "USDTB", "USDD", "GHO", "USD0", "FRAX", "FDUSD", "TUSD", "USDG",
@@ -29,11 +33,26 @@ const USD_STABLECOINS: ReadonlySet<string> = new Set([
   "USDM",
 ]);
 
-function isShortPair(collateralSymbol: string | null | undefined, debtSymbol: string | null | undefined): boolean {
-  if (!collateralSymbol || !debtSymbol) return false;
-  const coll = collateralSymbol.trim().toUpperCase();
-  const debt = debtSymbol.trim().toUpperCase();
-  return USD_STABLECOINS.has(coll) && !USD_STABLECOINS.has(debt);
+const MEGAETH_CHAIN_ID = 4326;
+const CL8Y_CB_ADDRESS = "0xfbaa45a537cf07dc768c469ffac4e88208b0098d";
+
+type TokenRef = { symbol?: string | null; id?: string | null };
+
+// Higher value = stronger anchor. -1 means "not an anchor".
+function anchorTier(token: TokenRef, chainId: number): number {
+  const sym = token.symbol?.trim().toUpperCase() ?? "";
+  if (sym && USD_STABLECOINS.has(sym)) return 3;
+  if (sym === "WETH") return 2;
+  const id = token.id?.toLowerCase() ?? "";
+  if (chainId === MEGAETH_CHAIN_ID && id === CL8Y_CB_ADDRESS) return 1;
+  return -1;
+}
+
+function isShortPair(collateral: TokenRef, debt: TokenRef, chainId: number): boolean {
+  const collTier = anchorTier(collateral, chainId);
+  if (collTier < 0) return false;
+  const debtTier = anchorTier(debt, chainId);
+  return debtTier < collTier;
 }
 
 // Bound multicall size + concurrency so a flaky RPC kills only one chunk.
@@ -214,8 +233,8 @@ export async function computeAndWritePositions(
     // on both sides so the arrow is meaningful. For longs we display
     // debt-per-collateral (the collateral asset priced in the debt token). For
     // shorts we invert and display collateral-per-debt (the shorted asset
-    // priced in the stablecoin collateral) — far more intuitive than "1 USDm
-    // = N RBT" when what users care about is RBT's USDm price.
+    // priced in the collateral) — far more intuitive than "1 USDm = N RBT"
+    // when what users care about is RBT's USDm price.
     //
     // Both fields are gated on the SAME inputs (mint amounts present + both
     // live USD prices present). If any input is missing we zero both so the
@@ -225,8 +244,9 @@ export async function computeAndWritePositions(
     // - debtPriceUsd / collateralPriceUsd can be 0 for tokens not indexed by
     //   CoinGecko and not findable via the DEX fallback.
     const isShort = isShortPair(
-      pos.vault.collateralToken.symbol,
-      pos.vault.debtToken.symbol
+      pos.vault.collateralToken,
+      pos.vault.debtToken,
+      chainId
     );
     const canPrice =
       originalCollateralAmount > 0 &&

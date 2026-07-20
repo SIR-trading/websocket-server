@@ -13,7 +13,14 @@ import {
   fetchAllApePositionIds,
   fetchAllTeaPositionIds,
 } from "./subgraph.js";
-import { fetchPrices, FEE_TIERS, type PoolHint } from "./prices.js";
+import {
+  fetchPrices,
+  fetchNativePrices,
+  cgCallStats,
+  resetCgCallStats,
+  FEE_TIERS,
+  type PoolHint,
+} from "./prices.js";
 import {
   computeAndWritePositions,
   filterPositions,
@@ -29,13 +36,33 @@ import {
 import { cacheVaultMetricsForChain } from "./vault-metrics.js";
 import type { WorkerStatus } from "./types.js";
 
-const INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const LOCK_TTL = 600; // 10 minutes (longer than expected run time)
 const MAX_POSITIONS_PER_RUN = parseInt(
   process.env.MAX_POSITIONS_PER_RUN ?? "500"
 );
 
+// Activity-gated cadence: the scheduler ticks on a fixed interval and starts a
+// new cycle once ACTIVE_INTERVAL_MS (recent app activity) or IDLE_INTERVAL_MS
+// (no activity) has elapsed since the last cycle end.
+const ACTIVE_INTERVAL_MS = parseInt(
+  process.env.LEADERBOARD_ACTIVE_INTERVAL_MS ?? "600000"
+);
+const IDLE_INTERVAL_MS = parseInt(
+  process.env.LEADERBOARD_IDLE_INTERVAL_MS ?? "3600000"
+);
+const SCHEDULER_TICK_MS = parseInt(
+  process.env.LEADERBOARD_SCHEDULER_TICK_MS ?? "60000"
+);
+// Cycle-claim TTL follows the active cadence: a fixed 600s claim would block
+// every follow-up cycle when ACTIVE_INTERVAL_MS is tuned below 10 minutes
+// (e.g. compressed-timing tests). Capped at LOCK_TTL, floored at 30s.
+const CYCLE_CLAIM_TTL = Math.min(
+  LOCK_TTL,
+  Math.max(30, Math.floor(ACTIVE_INTERVAL_MS / 1000))
+);
+
 let isRunning = false;
+let schedulerTimer: NodeJS.Timeout | null = null;
 let workerStatus: WorkerStatus = {
   enabled: false,
   lastRun: null,
@@ -66,19 +93,68 @@ export function startLeaderboardWorker(): void {
     `[LeaderboardWorker] Starting for chains: ${configs.map((c) => c.chainId).join(", ")}`
   );
 
-  // Run immediately on start, then schedule next run
+  // Boot cycle runs immediately; the scheduler then polls on a fixed tick and
+  // starts a new cycle when the activity-gated cadence interval has elapsed.
   void runCycle(configs);
+  schedulerTimer = setInterval(() => void tick(configs), SCHEDULER_TICK_MS);
 }
 
-function scheduleNextRun(configs: ChainConfig[]): void {
-  setTimeout(() => {
-    void runCycle(configs);
-  }, INTERVAL_MS);
+export function stopLeaderboardWorker(): void {
+  if (schedulerTimer) {
+    clearInterval(schedulerTimer);
+    schedulerTimer = null;
+  }
+}
+
+/**
+ * Scheduler tick: decide whether a new cycle is due. Gated by app activity
+ * (ACTIVE vs IDLE cadence), a shared last-cycle timestamp, and a per-slot
+ * claim so only one replica runs the cycle.
+ */
+async function tick(configs: ChainConfig[]): Promise<void> {
+  if (isRunning) return;
+
+  const redis = await getRedisClient();
+  if (!redis) return; // cycle would abort anyway
+
+  // Activity gate: fail open to ACTIVE so a Redis read error never stalls the
+  // leaderboard. app:lastActivity is written by the app on user activity.
+  let active = true;
+  try {
+    active = (await redis.exists("app:lastActivity")) === 1;
+  } catch {
+    active = true;
+  }
+  const interval = active ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
+
+  // Cadence gate: only run once per interval, tracked across replicas via
+  // leaderboard:lastCycleAt (stamped at every cycle end).
+  let lastCycleAt = 0;
+  try {
+    const raw = await redis.get("leaderboard:lastCycleAt");
+    const parsed = raw ? parseInt(raw, 10) : 0;
+    if (Number.isFinite(parsed)) lastCycleAt = parsed;
+  } catch {
+    lastCycleAt = 0;
+  }
+  const elapsed = Date.now() - lastCycleAt;
+  if (elapsed < interval) return;
+
+  // Slot claim: only one replica runs the cycle for this slot.
+  const acquired = await redis.set("leaderboard:cycleClaim", randomUUID(), {
+    NX: true,
+    EX: CYCLE_CLAIM_TTL,
+  });
+  if (!acquired) return;
+
+  console.log(
+    `[LeaderboardWorker] Cadence=${active ? "ACTIVE" : "IDLE"} (elapsed=${Math.round(elapsed / 1000)}s) - running cycle`
+  );
+  void runCycle(configs);
 }
 
 async function runCycle(configs: ChainConfig[]): Promise<void> {
   if (isRunning) {
-    scheduleNextRun(configs);
     return;
   }
 
@@ -89,22 +165,56 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
   if (!redis) {
     console.warn("[LeaderboardWorker] Redis unavailable, skipping cycle");
     isRunning = false;
-    scheduleNextRun(configs);
     return;
   }
 
   console.log("[LeaderboardWorker] Starting cycle...");
 
-  // Phase 1: Cache prices for all chains (used by both Next.js app and leaderboard)
-  for (const config of configs) {
+  // Phase 1: Cache prices for all chains (used by both Next.js app and
+  // leaderboard). Guarded by a single global lock so only one replica runs the
+  // price phase per cycle; other replicas skip straight to Phase 1.5+.
+  const priceLockKey = "prices:worker:lock";
+  const priceLockToken = randomUUID();
+  const priceLockAcquired = await redis.set(priceLockKey, priceLockToken, {
+    NX: true,
+    EX: LOCK_TTL,
+  });
+
+  if (!priceLockAcquired) {
+    console.log(
+      "[PriceCache] Price lock held by another instance, skipping price phase"
+    );
+  } else {
     try {
-      await cachePricesForChain(config, redis);
-    } catch (error) {
-      console.error(
-        `[PriceCache] Chain ${config.chainId} price caching failed:`,
-        error
+      resetCgCallStats();
+      // One combined native-price call for all chains, reused by every chain's
+      // fetchPrices below instead of a per-chain /simple/price request.
+      const nativePrices = await fetchNativePrices(configs);
+      for (const config of configs) {
+        try {
+          await cachePricesForChain(config, redis, nativePrices);
+        } catch (error) {
+          console.error(
+            `[PriceCache] Chain ${config.chainId} price caching failed:`,
+            error
+          );
+          // Continue - stale Redis data is better than no data
+        }
+      }
+      const totalCgCalls = cgCallStats.tokenPrice + cgCallStats.native;
+      console.log(
+        `[Prices] Cycle CoinGecko calls: ${totalCgCalls} (token_price=${cgCallStats.tokenPrice}, native=${cgCallStats.native})`
       );
-      // Continue - stale Redis data is better than no data
+    } finally {
+      // Safe release: only delete if we still own the lock
+      try {
+        const currentToken = await redis.get(priceLockKey);
+        if (currentToken === priceLockToken) {
+          await redis.del(priceLockKey);
+        }
+      } catch {
+        // Ignore lock release errors
+      }
     }
   }
 
@@ -220,10 +330,18 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
   workerStatus.lastRun = Date.now();
   workerStatus.lastDurationMs = duration;
 
+  // Stamp cycle-end time so the activity-gated scheduler waits one full
+  // interval before the next cycle. Unconditional (same semantics as lastRun):
+  // a failed cycle still waits one interval.
+  try {
+    await redis.set("leaderboard:lastCycleAt", Date.now().toString());
+  } catch (error) {
+    console.warn("[LeaderboardWorker] Failed to stamp lastCycleAt:", error);
+  }
+
   console.log(`[LeaderboardWorker] Cycle complete in ${duration}ms`);
 
   isRunning = false;
-  scheduleNextRun(configs);
 }
 
 /**
@@ -233,7 +351,8 @@ async function runCycle(configs: ChainConfig[]): Promise<void> {
  */
 async function cachePricesForChain(
   config: ChainConfig,
-  redis: RedisClientType
+  redis: RedisClientType,
+  nativePrices: Record<string, number>
 ): Promise<void> {
   const chainId = config.chainId;
   const client = createSubgraphClient(config.subgraphUrl, config.subgraphApiKey);
@@ -277,7 +396,8 @@ async function cachePricesForChain(
     config,
     tokens,
     hints,
-    vaultPairs
+    vaultPairs,
+    nativePrices
   );
 
   // 6. Guard: only write if at least one price came from a real source

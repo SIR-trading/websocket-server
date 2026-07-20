@@ -14,6 +14,7 @@ import {
 } from "viem";
 import {
   startLeaderboardWorker,
+  stopLeaderboardWorker,
   getWorkerStatus,
 } from "./workers/leaderboard/index.js";
 import { startReferralScoringWorker } from "./workers/referrals/index.js";
@@ -1313,6 +1314,9 @@ async function shutdown() {
   watchers.forEach((w) => {
     if (w.pollTimer) clearInterval(w.pollTimer);
   });
+
+  // Stop the leaderboard scheduler tick
+  stopLeaderboardWorker();
 
   // Clean up LP staking watchers
   lpWatcherUnwatchFns.forEach((fn) => fn());

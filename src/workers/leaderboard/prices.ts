@@ -20,6 +20,17 @@ const RANK_NATIVE = 0;
 const RANK_ANCHOR_STUB = 1;
 const RANK_DEX_PROBE = 2;
 
+// Per-cycle CoinGecko HTTP call counter. Reset at the start of each price
+// phase via resetCgCallStats() and read at the end for a single summary log
+// line. Counts only the priced calls (token_price + native), not the
+// key-type detection ping in coingecko.ts.
+export const cgCallStats = { tokenPrice: 0, native: 0 };
+
+export function resetCgCallStats(): void {
+  cgCallStats.tokenPrice = 0;
+  cgCallStats.native = 0;
+}
+
 function isUsablePairAddress(addr: string): boolean {
   try {
     getAddress(addr);
@@ -136,6 +147,7 @@ async function fetchCoinGeckoPrices(
     headers[cg.headerKey] = cg.apiKey;
   }
 
+  cgCallStats.tokenPrice += 1;
   try {
     const addresses = tokens.map((t) => t.toLowerCase()).join(",");
     const response = await fetch(
@@ -165,10 +177,23 @@ async function fetchCoinGeckoPrices(
 }
 
 /**
- * Fetch native token price using CoinGecko coin ID (e.g., "ethereum", "matic-network")
+ * Fetch native-token USD prices for every configured chain in a single
+ * CoinGecko /simple/price call. Collects the unique `coingeckoNativeId`
+ * values (e.g. "ethereum", "hyperliquid") across configs and returns
+ * { [coinId]: usd } for entries with usd > 0. Returns {} when no chain
+ * has a native id or on any error.
  */
-async function fetchNativePrice(coinId: string): Promise<number> {
-  if (!coinId) return 0;
+export async function fetchNativePrices(
+  configs: ChainConfig[]
+): Promise<Record<string, number>> {
+  const ids = [
+    ...new Set(
+      configs
+        .map((c) => c.coingeckoNativeId)
+        .filter((id): id is string => Boolean(id))
+    ),
+  ];
+  if (ids.length === 0) return {};
 
   const cg = await getCoingeckoConfig();
   const headers: HeadersInit = { accept: "application/json" };
@@ -176,22 +201,29 @@ async function fetchNativePrice(coinId: string): Promise<number> {
     headers[cg.headerKey] = cg.apiKey;
   }
 
+  cgCallStats.native += 1;
   try {
     const response = await fetch(
-      `${cg.baseUrl}/simple/price?ids=${coinId}&vs_currencies=usd`,
+      `${cg.baseUrl}/simple/price?ids=${ids.join(",")}&vs_currencies=usd`,
       { headers }
     );
 
     if (!response.ok) {
       console.warn(`[Prices] CoinGecko native price returned ${response.status}`);
-      return 0;
+      return {};
     }
 
     const data = (await response.json()) as Record<string, { usd?: number }>;
-    return data[coinId]?.usd ?? 0;
+    const prices: Record<string, number> = {};
+    for (const [id, priceData] of Object.entries(data)) {
+      if (priceData?.usd && priceData.usd > 0) {
+        prices[id] = priceData.usd;
+      }
+    }
+    return prices;
   } catch (error) {
     console.error("[Prices] CoinGecko native price fetch failed:", error);
-    return 0;
+    return {};
   }
 }
 
@@ -427,7 +459,8 @@ export async function fetchPrices(
   config: ChainConfig,
   tokens: Map<string, { decimals: number }>,
   hints: Map<string, PoolHint> = new Map(),
-  pairs: VaultPair[] = []
+  pairs: VaultPair[] = [],
+  nativePrices: Record<string, number> = {}
 ): Promise<FetchPricesResult> {
   if (tokens.size === 0)
     return { prices: {}, winningPools: new Map(), derivedCount: 0 };
@@ -458,9 +491,10 @@ export async function fetchPrices(
     derivedCount += Object.keys(cgPrices).length;
   }
 
-  // Step 2: Ensure wrapped native has a price (use coin ID if contract lookup failed)
+  // Step 2: Ensure wrapped native has a price (use the native coin-id price
+  // fetched once per cycle for all chains if the contract lookup failed).
   if (!priceMap[wrappedNativeLower] && config.coingeckoNativeId) {
-    const nativePrice = await fetchNativePrice(config.coingeckoNativeId);
+    const nativePrice = nativePrices[config.coingeckoNativeId] ?? 0;
     if (nativePrice > 0) {
       priceMap[wrappedNativeLower] = nativePrice;
       sourceRank.set(wrappedNativeLower, RANK_NATIVE);
